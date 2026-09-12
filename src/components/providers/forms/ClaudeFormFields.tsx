@@ -48,6 +48,7 @@ import {
 } from "@/lib/api/model-fetch";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
+import { OutboundProxyField } from "./OutboundProxyField";
 import type {
   ProviderCategory,
   ClaudeApiFormat,
@@ -155,6 +156,10 @@ interface ClaudeFormFieldsProps {
   // Local proxy User-Agent override
   customUserAgent: string;
   onCustomUserAgentChange: (value: string) => void;
+  // Outbound proxy policy (Plan A): true = use the global proxy, false = force
+  // a direct connection for this provider's upstream requests.
+  useGlobalOutboundProxy: boolean;
+  onUseGlobalOutboundProxyChange: (value: boolean) => void;
   localProxyHeadersOverride: string;
   onLocalProxyHeadersOverrideChange: (value: string) => void;
   localProxyBodyOverride: string;
@@ -221,6 +226,8 @@ export function ClaudeFormFields({
   onFullUrlChange,
   customUserAgent,
   onCustomUserAgentChange,
+  useGlobalOutboundProxy,
+  onUseGlobalOutboundProxyChange,
   localProxyHeadersOverride,
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
@@ -240,6 +247,10 @@ export function ClaudeFormFields({
     (!isXaiOauthPreset && apiFormat !== "anthropic") ||
     apiKeyField !== "ANTHROPIC_AUTH_TOKEN" ||
     customUserAgent ||
+    // A provider that opts out of the global proxy counts as a meaningful
+    // advanced value, so re-opening the form auto-expands the section instead
+    // of hiding the switch the user already turned off.
+    !useGlobalOutboundProxy ||
     hasRequestOverrides
   );
   const [advancedExpanded, setAdvancedExpanded] = useState(
@@ -1099,6 +1110,12 @@ export function ClaudeFormFields({
               id="claude-custom-user-agent"
               value={customUserAgent}
               onChange={onCustomUserAgentChange}
+            />
+
+            <OutboundProxyField
+              id="claude-outbound-proxy"
+              useGlobalProxy={useGlobalOutboundProxy}
+              onChange={onUseGlobalOutboundProxyChange}
             />
 
             <div className="border-t border-border-default pt-3">

@@ -166,6 +166,23 @@ export interface CodexChatReasoning {
 
 export type PromptCacheRoutingMode = "auto" | "enabled" | "disabled";
 
+/**
+ * Outbound proxy policy for a single provider (Plan A / provider-level proxy override).
+ *
+ * Why this exists: cc-switch has exactly one application-wide outbound proxy
+ * setting, and every forwarded upstream request shared one HTTP client, so
+ * "use the proxy" was all-or-nothing for the whole app. That breaks the common
+ * corporate setup where one provider points at an **internal** endpoint
+ * (direct-only) and another at an **external** vendor endpoint (proxy-only):
+ * either global state makes the other provider fail.
+ *
+ * - `undefined` / `"inherit"`: follow the global outbound proxy. Default and
+ *   identical to the behaviour before this field existed.
+ * - `"direct"`: force a direct connection for this provider's upstream
+ *   requests, bypassing both the global proxy and the system proxy.
+ */
+export type OutboundProxyMode = "inherit" | "direct";
+
 export interface LocalProxyRequestOverrides {
   headers?: Record<string, string>;
   body?: Record<string, unknown>;
@@ -230,6 +247,11 @@ export interface ProviderMeta {
   customUserAgent?: string;
   // Local proxy request overrides. Only applied by the local proxy after route transforms.
   localProxyRequestOverrides?: LocalProxyRequestOverrides;
+  // Per-provider outbound proxy policy. Consumed by the Rust request forwarder,
+  // which is the single place deciding how a routed upstream request leaves the
+  // app. Unset/"inherit" keeps the legacy behaviour (use the global proxy);
+  // "direct" bypasses both the global proxy and the system proxy.
+  outboundProxy?: OutboundProxyMode;
   // Whether this provider is currently projected into an additive app's live config.
   liveConfigManaged?: boolean;
   // 供应商类型（用于识别 Copilot 等特殊供应商）

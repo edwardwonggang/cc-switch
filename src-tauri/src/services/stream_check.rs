@@ -143,7 +143,21 @@ impl StreamCheckService {
             None => Self::resolve_base_url(app_type, provider)?,
         };
 
-        let client = crate::proxy::http_client::get();
+        // Honour the provider-level outbound proxy policy (Plan A) so the
+        // reachability check reflects what the forwarded request would actually
+        // do. Without this, a provider configured as "direct" would still be
+        // probed through the corporate proxy and report a failure even though
+        // real traffic works — actively misleading while debugging.
+        let client = if provider
+            .meta
+            .as_ref()
+            .map(|meta| meta.forces_direct_outbound())
+            .unwrap_or(false)
+        {
+            crate::proxy::http_client::get_direct()
+        } else {
+            crate::proxy::http_client::get()
+        };
         let timeout = std::time::Duration::from_secs(config.timeout_secs);
         let ua = Self::custom_user_agent(provider);
 

@@ -422,6 +422,10 @@ function ProviderFormFull({
     setCodexChatReasoning(initialData?.meta?.codexChatReasoning ?? {});
     setPromptCacheRouting(initialData?.meta?.promptCacheRouting ?? "auto");
     setCustomUserAgent(initialData?.meta?.customUserAgent ?? "");
+    // Plan A: the switch is expressed in the UI as a positive "use the global
+    // proxy" toggle, so an absent/legacy meta value maps to `true` (unchanged
+    // behaviour). Only an explicit "direct" turns it off.
+    setUseGlobalOutboundProxy(initialData?.meta?.outboundProxy !== "direct");
     setLocalProxyHeadersOverride(
       formatRequestOverrideObject(
         initialData?.meta?.localProxyRequestOverrides?.headers,
@@ -620,6 +624,12 @@ function ProviderFormFull({
     );
   const [customUserAgent, setCustomUserAgent] = useState<string>(
     () => initialData?.meta?.customUserAgent ?? "",
+  );
+  // Plan A: outbound proxy policy. `true` = follow the global proxy (default and
+  // identical to the pre-existing behaviour); `false` = force a direct
+  // connection for this provider, persisted as `meta.outboundProxy = "direct"`.
+  const [useGlobalOutboundProxy, setUseGlobalOutboundProxy] = useState<boolean>(
+    () => initialData?.meta?.outboundProxy !== "direct",
   );
   const [localProxyHeadersOverride, setLocalProxyHeadersOverride] =
     useState<string>(() =>
@@ -1773,6 +1783,15 @@ function ProviderFormFull({
         (appId === "claude" || appId === "codex") && category !== "official"
           ? customUserAgent.trim() || undefined
           : undefined,
+      // Plan A: persist only the non-default case. Writing `undefined` when the
+      // switch is ON keeps existing configs, presets and deeplinks untouched and
+      // avoids rewriting every provider on save.
+      outboundProxy:
+        (appId === "claude" || appId === "codex") &&
+        category !== "official" &&
+        !useGlobalOutboundProxy
+          ? "direct"
+          : undefined,
       localProxyRequestOverrides: shouldApplyLocalProxyRequestOverrides
         ? overridesResult.overrides
         : undefined,
@@ -2430,6 +2449,8 @@ function ProviderFormFull({
               onFullUrlChange={setLocalIsFullUrl}
               customUserAgent={customUserAgent}
               onCustomUserAgentChange={setCustomUserAgent}
+              useGlobalOutboundProxy={useGlobalOutboundProxy}
+              onUseGlobalOutboundProxyChange={setUseGlobalOutboundProxy}
               localProxyHeadersOverride={localProxyHeadersOverride}
               onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
               localProxyBodyOverride={localProxyBodyOverride}
@@ -2505,6 +2526,8 @@ function ProviderFormFull({
               speedTestEndpoints={speedTestEndpoints}
               customUserAgent={customUserAgent}
               onCustomUserAgentChange={setCustomUserAgent}
+              useGlobalOutboundProxy={useGlobalOutboundProxy}
+              onUseGlobalOutboundProxyChange={setUseGlobalOutboundProxy}
               localProxyHeadersOverride={localProxyHeadersOverride}
               onLocalProxyHeadersOverrideChange={setLocalProxyHeadersOverride}
               localProxyBodyOverride={localProxyBodyOverride}

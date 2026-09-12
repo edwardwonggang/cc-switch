@@ -2,6 +2,15 @@
 //!
 //! 提供支持全局代理配置的 HTTP 客户端。
 //! 所有需要发送 HTTP 请求的模块都应使用此模块提供的客户端。
+//!
+//! Two clients are available:
+//! - [`get`] — the shared client honouring the global proxy setting. When no
+//!   global proxy is configured it follows the system proxy, which is the
+//!   legacy behaviour and the correct one for most callers.
+//! - [`get_direct`] — a client with all proxying disabled, used only by the
+//!   request forwarder when a provider opts out of the proxy via
+//!   [`crate::provider::OutboundProxyMode::Direct`]. Kept separate because
+//!   "no proxy configured" and "bypass every proxy" are different things.
 
 use once_cell::sync::OnceCell;
 use reqwest::Client;
@@ -12,6 +21,17 @@ use std::time::Duration;
 
 /// 全局 HTTP 客户端实例
 static GLOBAL_CLIENT: OnceCell<RwLock<Client>> = OnceCell::new();
+
+/// HTTP client used for provider-level "force direct connection" overrides.
+///
+/// Added for Plan A (per-provider outbound proxy policy). It must be a
+/// *separate* client from [`GLOBAL_CLIENT`]: the global client's "no proxy
+/// configured" state means **follow the system proxy**, so reusing it for a
+/// provider that asked to bypass the proxy would still route the request
+/// through the corporate proxy on a corporate machine — exactly the bug being
+/// fixed. This client is built once with [`ProxyPolicy::Direct`] and is
+/// immutable, since the direct behaviour never depends on user settings.
+static DIRECT_CLIENT: OnceCell<Client> = OnceCell::new();
 
 /// 当前代理 URL（用于日志和状态查询）
 static CURRENT_PROXY_URL: OnceCell<RwLock<Option<String>>> = OnceCell::new();
@@ -212,8 +232,55 @@ pub fn is_proxy_enabled() -> bool {
     get_current_proxy_url().is_some()
 }
 
-/// 构建 HTTP 客户端
-fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
+/// Returns the explicitly proxy-disabled HTTP client (Plan A).
+///
+/// Satisfies [`crate::provider::OutboundProxyMode::Direct`]: such a provider's
+/// upstream requests must bypass **both** the global proxy and the system proxy.
+///
+/// Important: callers must NOT simply pass `None` to [`get`] / [`build_client`],
+/// because `None` means "follow the system proxy". A direct connection has to go
+/// through an explicit `no_proxy()`, otherwise on a corporate network the request
+/// still ends up on the corporate proxy and the new switch silently does nothing.
+pub fn get_direct() -> Client {
+    DIRECT_CLIENT
+        .get_or_init(|| match build_client_with_policy(ProxyPolicy::Direct) {
+            Ok(client) => client,
+            Err(e) => {
+                // Building a direct client cannot realistically fail (there is no
+                // URL to parse). The fallback still has to stay proxy-free so we
+                // never silently fall back onto the proxy we were asked to skip.
+                log::error!(
+                    "[GlobalProxy] [GP-005] Failed to build direct client: {e}; \
+                     falling back to a proxy-disabled client"
+                );
+                Client::builder().no_proxy().build().unwrap_or_default()
+            }
+        })
+        .clone()
+}
+
+/// How an HTTP client should treat outbound proxies.
+///
+/// The three cases must stay strictly distinct: **"no proxy configured" is not
+/// the same as "bypass every proxy"**. `System` follows the OS/env proxy (which
+/// on a corporate machine is the corporate proxy), while `Direct` disables
+/// proxying entirely. Conflating the two is exactly what caused the
+/// "either everything is proxied or nothing is" deadlock — see
+/// [`crate::provider::OutboundProxyMode`].
+#[derive(Debug, Clone, Copy)]
+enum ProxyPolicy<'a> {
+    /// Follow the OS/env proxy (environment variables plus the Windows registry
+    /// settings, as detected by reqwest).
+    System,
+    /// Use the given explicit proxy URL for every scheme and host.
+    Explicit(&'a str),
+    /// Force a direct connection: ignore the explicit config, the environment
+    /// variables and the OS proxy settings.
+    Direct,
+}
+
+/// Builds an HTTP client according to `policy`.
+fn build_client_with_policy(policy: ProxyPolicy<'_>) -> Result<Client, String> {
     let mut builder = Client::builder()
         .timeout(Duration::from_secs(600))
         .connect_timeout(Duration::from_secs(30))
@@ -226,41 +293,65 @@ fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
         .no_deflate()
         .no_zstd();
 
-    // 有代理地址则使用代理，否则跟随系统代理
-    if let Some(url) = proxy_url {
-        // 先验证 URL 格式和 scheme
-        let parsed = url::Url::parse(url)
-            .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?;
+    match policy {
+        ProxyPolicy::Explicit(url) => {
+            // 先验证 URL 格式和 scheme
+            let parsed = url::Url::parse(url)
+                .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?;
 
-        let scheme = parsed.scheme();
-        if !["http", "https", "socks5", "socks5h"].contains(&scheme) {
-            return Err(format!(
-                "Invalid proxy scheme '{}' in URL '{}'. Supported: http, https, socks5, socks5h",
-                scheme,
-                mask_url(url)
-            ));
+            let scheme = parsed.scheme();
+            if !["http", "https", "socks5", "socks5h"].contains(&scheme) {
+                return Err(format!(
+                    "Invalid proxy scheme '{}' in URL '{}'. Supported: http, https, socks5, socks5h",
+                    scheme,
+                    mask_url(url)
+                ));
+            }
+
+            let proxy = reqwest::Proxy::all(url)
+                .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?;
+            builder = builder.proxy(proxy);
+            log::debug!("[GlobalProxy] Proxy configured: {}", mask_url(url));
         }
-
-        let proxy = reqwest::Proxy::all(url)
-            .map_err(|e| format!("Invalid proxy URL '{}': {}", mask_url(url), e))?;
-        builder = builder.proxy(proxy);
-        log::debug!("[GlobalProxy] Proxy configured: {}", mask_url(url));
-    } else {
-        // 未设置全局代理时，让 reqwest 自动检测系统代理（环境变量）
-        // 若系统代理指向本机，禁用系统代理避免自环
-        if system_proxy_points_to_loopback() {
+        ProxyPolicy::System => {
+            // 未设置全局代理时，让 reqwest 自动检测系统代理（环境变量）
+            // 若系统代理指向本机，禁用系统代理避免自环
+            if system_proxy_points_to_loopback() {
+                builder = builder.no_proxy();
+                log::warn!(
+                    "[GlobalProxy] System proxy points to localhost, bypassing to avoid recursion"
+                );
+            } else {
+                log::debug!("[GlobalProxy] Following system proxy (no explicit proxy configured)");
+            }
+        }
+        ProxyPolicy::Direct => {
+            // Force a direct connection: clear the proxy list *and* turn off
+            // reqwest's system-proxy detection. Both are required — clearing the
+            // list alone would let reqwest fall back to the system proxy
+            // (`ClientBuilder::no_proxy` internally clears `proxies` and sets
+            // `auto_sys_proxy = false`), which on an internal-network endpoint
+            // means the switch would silently have no effect.
             builder = builder.no_proxy();
-            log::warn!(
-                "[GlobalProxy] System proxy points to localhost, bypassing to avoid recursion"
-            );
-        } else {
-            log::debug!("[GlobalProxy] Following system proxy (no explicit proxy configured)");
+            log::debug!("[GlobalProxy] Direct connection forced (all proxies disabled)");
         }
     }
 
     builder
         .build()
         .map_err(|e| format!("Failed to build HTTP client: {e}"))
+}
+
+/// Backwards-compatible entry point for building an HTTP client.
+///
+/// `Some(url)` = use the explicit proxy; `None` = **follow the system proxy**
+/// (note: not a direct connection). Use [`get_direct`] when a direct connection
+/// must be forced.
+fn build_client(proxy_url: Option<&str>) -> Result<Client, String> {
+    build_client_with_policy(match proxy_url {
+        Some(url) => ProxyPolicy::Explicit(url),
+        None => ProxyPolicy::System,
+    })
 }
 
 fn system_proxy_points_to_loopback() -> bool {
@@ -404,6 +495,38 @@ mod tests {
         // reqwest::Proxy::all 对某些无效 URL 不会立即报错
         // 使用明确无效的 scheme 来触发错误
         let result = build_client(Some("invalid-scheme://127.0.0.1:7890"));
+        assert!(result.is_err(), "Should reject invalid proxy scheme");
+    }
+
+    /// Plan A: the "force direct" policy must build a client even while a system
+    /// proxy is exported. This is the regression that matters in the corporate
+    /// scenario — if `Direct` ever fell back to the system proxy, the newly added
+    /// per-provider switch would silently do nothing.
+    #[test]
+    fn test_build_client_direct_policy_ignores_system_proxy() {
+        let _guard = env_lock().lock().unwrap();
+
+        std::env::set_var("HTTP_PROXY", "http://10.0.0.2:7890");
+        std::env::set_var("HTTPS_PROXY", "http://10.0.0.2:7890");
+        std::env::set_var("ALL_PROXY", "http://10.0.0.2:7890");
+
+        assert!(build_client_with_policy(ProxyPolicy::Direct).is_ok());
+        // The cached lazy instance used by the forwarder must be usable as well.
+        let _ = get_direct();
+        // The legacy entry point keeps its "follow system proxy" semantics, so a
+        // `None` passed down by mistake would still use the proxy.
+        assert!(build_client(None).is_ok());
+
+        for key in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            std::env::remove_var(key);
+        }
+    }
+
+    /// Proxy URL validation must be preserved on the refactored policy path.
+    #[test]
+    fn test_build_client_with_policy_rejects_invalid_scheme() {
+        let result =
+            build_client_with_policy(ProxyPolicy::Explicit("invalid-scheme://127.0.0.1:7890"));
         assert!(result.is_err(), "Should reject invalid proxy scheme");
     }
 

@@ -2327,8 +2327,44 @@ impl RequestForwarder {
             self.non_streaming_timeout
         };
 
-        // 获取全局代理 URL
-        let upstream_proxy_url: Option<String> = super::http_client::get_current_proxy_url();
+        // Decide the outbound proxy for this upstream request
+        // (Plan A / provider-level proxy override).
+        //
+        // A provider may opt out of the global proxy via
+        // `meta.outboundProxy = "direct"`. That is what lets an internal model
+        // endpoint and an external vendor endpoint coexist on one corporate
+        // machine: the internal one goes direct, the external one uses the
+        // corporate proxy.
+        //
+        // Two details matter here, and both are easy to get wrong:
+        //
+        // 1. Passing `None` downward is NOT enough. `http_client::build_client(None)`
+        //    means "follow the system proxy", and on a corporate machine the system
+        //    proxy IS the proxy we are trying to skip. The reqwest branch below must
+        //    therefore switch to the explicitly proxy-disabled client, otherwise the
+        //    new switch would silently do nothing.
+        // 2. Both branches must see the same decision. The reqwest path (Codex /
+        //    OpenAI-style backends) and the hyper CONNECT path (Claude, raw write to
+        //    preserve header casing) each establish their own connection, so
+        //    overriding only one would leave the other still proxied.
+        let force_direct_outbound = provider
+            .meta
+            .as_ref()
+            .map(|meta| meta.forces_direct_outbound())
+            .unwrap_or(false);
+
+        let upstream_proxy_url: Option<String> = if force_direct_outbound {
+            log::debug!(
+                "[Forwarder] Provider '{}' forces direct outbound; bypassing proxy {}",
+                provider.id,
+                super::http_client::get_current_proxy_url()
+                    .map(|u| super::http_client::mask_url(&u))
+                    .unwrap_or_else(|| "(system proxy)".to_string())
+            );
+            None
+        } else {
+            super::http_client::get_current_proxy_url()
+        };
 
         // SOCKS5 代理不支持 CONNECT 隧道，需要用 reqwest
         let is_socks_proxy = upstream_proxy_url
@@ -2350,7 +2386,15 @@ impl RequestForwarder {
             log::debug!(
                 "[Forwarder] Using pooled reqwest client (preserve_exact_header_case={preserve_exact_header_case}, socks_proxy={is_socks_proxy})"
             );
-            let client = super::http_client::get();
+            // When the provider forces a direct connection we must switch to the
+            // explicitly proxy-disabled client: `get()` falls back to the system
+            // proxy whenever no global proxy is configured, which would defeat
+            // the bypass on exactly the corporate machines that need it.
+            let client = if force_direct_outbound {
+                super::http_client::get_direct()
+            } else {
+                super::http_client::get()
+            };
             let mut request = client.request(method.clone(), &url);
             if request_is_streaming {
                 // reqwest 的 timeout 是整请求超时；流式请求交给 response_processor

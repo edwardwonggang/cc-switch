@@ -52,6 +52,7 @@ import {
 } from "@/lib/api/model-fetch";
 import { CustomUserAgentField } from "./CustomUserAgentField";
 import { LocalProxyRequestOverridesField } from "./LocalProxyRequestOverridesField";
+import { OutboundProxyField } from "./OutboundProxyField";
 import { cn } from "@/lib/utils";
 import type {
   ClaudeApiKeyField,
@@ -142,6 +143,10 @@ interface CodexFormFieldsProps {
   // Local proxy User-Agent override
   customUserAgent: string;
   onCustomUserAgentChange: (value: string) => void;
+  // Outbound proxy policy (Plan A): true = use the global proxy, false = force
+  // a direct connection for this provider's upstream requests.
+  useGlobalOutboundProxy: boolean;
+  onUseGlobalOutboundProxyChange: (value: boolean) => void;
   localProxyHeadersOverride: string;
   onLocalProxyHeadersOverrideChange: (value: string) => void;
   localProxyBodyOverride: string;
@@ -420,6 +425,8 @@ export function CodexFormFields({
   speedTestEndpoints,
   customUserAgent,
   onCustomUserAgentChange,
+  useGlobalOutboundProxy,
+  onUseGlobalOutboundProxyChange,
   localProxyHeadersOverride,
   onLocalProxyHeadersOverrideChange,
   localProxyBodyOverride,
@@ -468,6 +475,10 @@ export function CodexFormFields({
   );
   const hasAnyAdvancedValue =
     !!customUserAgent ||
+    // A provider that opts out of the global proxy counts as a meaningful
+    // advanced value, so re-opening the form auto-expands the section instead
+    // of hiding the switch the user already turned off.
+    !useGlobalOutboundProxy ||
     hasRequestOverrides ||
     catalogModels.length > 0 ||
     apiFormat === "openai_responses" ||
@@ -1360,6 +1371,11 @@ export function CodexFormFields({
                 id="codex-custom-user-agent"
                 value={customUserAgent}
                 onChange={onCustomUserAgentChange}
+              />
+              <OutboundProxyField
+                id="codex-outbound-proxy"
+                useGlobalProxy={useGlobalOutboundProxy}
+                onChange={onUseGlobalOutboundProxyChange}
               />
               <div className="border-t border-border-default pt-3">
                 <LocalProxyRequestOverridesField

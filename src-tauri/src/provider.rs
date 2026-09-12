@@ -439,6 +439,37 @@ impl LocalProxyRequestOverrides {
     }
 }
 
+/// Per-provider outbound proxy policy (Plan A / provider-level proxy override).
+///
+/// Background — why this field exists:
+/// cc-switch keeps a single, application-wide outbound proxy setting
+/// (`global_proxy_url`), and every forwarded upstream request used to share one
+/// HTTP client, so "go through the proxy" was all-or-nothing for the whole app.
+/// That breaks the very common corporate setup where one provider points at an
+/// **internal** model endpoint (reachable only by direct connection) while
+/// another provider points at an **external** vendor endpoint (reachable only
+/// through the corporate proxy). Picking either global state made the other
+/// provider fail.
+///
+/// This field restores the per-provider granularity that was removed in v3.14
+/// (see `ProviderProxyConfig` in v3.13.0), but deliberately narrower: it only
+/// expresses intent to bypass the proxy, not a second proxy to use.
+///
+/// Additive by design — `None` keeps the legacy behaviour, so existing provider
+/// configs, presets and deeplinks need no migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutboundProxyMode {
+    /// Follow the global outbound proxy (default). Identical to the behaviour
+    /// before this field existed, so `None` and `Inherit` are equivalent.
+    #[default]
+    Inherit,
+    /// Force a direct connection for this provider's upstream requests,
+    /// bypassing **both** the configured global proxy and the OS/env system
+    /// proxy. Use this for internal/private endpoints.
+    Direct,
+}
+
 /// 供应商元数据
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderMeta {
@@ -550,6 +581,14 @@ pub struct ProviderMeta {
         skip_serializing_if = "Option::is_none"
     )]
     pub local_proxy_request_overrides: Option<LocalProxyRequestOverrides>,
+    /// Per-provider outbound proxy policy. See [`OutboundProxyMode`] for why this
+    /// exists. `None` / `"inherit"` = follow the global proxy (legacy behaviour);
+    /// `"direct"` = this provider's upstream request must not use any proxy.
+    ///
+    /// Consumed by the request forwarder only (see `proxy::forwarder`), which is
+    /// the single place that decides how a routed upstream request leaves the app.
+    #[serde(rename = "outboundProxy", skip_serializing_if = "Option::is_none")]
+    pub outbound_proxy: Option<OutboundProxyMode>,
     /// 累加模式应用中，该 provider 是否已写入 live config。
     /// `None` 表示旧数据/未知状态，`Some(false)` 表示明确仅存在于数据库中。
     #[serde(rename = "liveConfigManaged", skip_serializing_if = "Option::is_none")]
@@ -598,6 +637,20 @@ impl ProviderMeta {
     /// 经校验的 Provider 级自定义 User-Agent。见 [`parse_custom_user_agent`]。
     pub fn custom_user_agent_header(&self) -> Result<Option<HeaderValue>, InvalidHeaderValue> {
         parse_custom_user_agent(self.custom_user_agent.as_deref())
+    }
+
+    /// Whether this provider's upstream requests must bypass every proxy
+    /// (global config *and* OS/env system proxy).
+    ///
+    /// Defaults to `false` for both `None` and `Some(Inherit)`, which keeps the
+    /// legacy "follow the global proxy" behaviour for all pre-existing configs.
+    ///
+    /// Callers must handle the resulting "direct" case with an explicitly
+    /// proxy-disabled HTTP client: passing `None` down to the shared client
+    /// builder is **not** enough, because that path means "follow the system
+    /// proxy" — which on a corporate machine is the very proxy being bypassed.
+    pub fn forces_direct_outbound(&self) -> bool {
+        matches!(self.outbound_proxy, Some(OutboundProxyMode::Direct))
     }
 
     /// 解析指定托管认证供应商绑定的账号 ID。
@@ -1017,10 +1070,57 @@ pub struct OpenCodeModelLimit {
 mod tests {
     use super::{
         ClaudeModelConfig, CodexModelConfig, GeminiModelConfig, LocalProxyRequestOverrides,
-        OpenCodeProviderConfig, Provider, ProviderManager, ProviderMeta, UniversalProvider,
+        OpenCodeProviderConfig, OutboundProxyMode, Provider, ProviderManager, ProviderMeta,
+        UniversalProvider,
     };
     use serde_json::json;
     use std::collections::HashMap;
+
+    /// Plan A regression guard.
+    ///
+    /// Why: the default MUST stay "follow the global proxy". Existing provider
+    /// configs, preset files and deeplinks never contain `outboundProxy`, so if
+    /// an absent field ever started meaning "direct", every user would silently
+    /// lose their configured proxy.
+    #[test]
+    fn outbound_proxy_defaults_to_inherit() {
+        // Absent field (i.e. every pre-existing config) => inherit.
+        let meta: ProviderMeta = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(meta.outbound_proxy, None);
+        assert!(!meta.forces_direct_outbound());
+
+        // Explicit "inherit" behaves exactly like the absent field.
+        let meta: ProviderMeta =
+            serde_json::from_value(json!({ "outboundProxy": "inherit" })).unwrap();
+        assert_eq!(meta.outbound_proxy, Some(OutboundProxyMode::Inherit));
+        assert!(!meta.forces_direct_outbound());
+
+        // "direct" is the only value that flips the policy.
+        let meta: ProviderMeta =
+            serde_json::from_value(json!({ "outboundProxy": "direct" })).unwrap();
+        assert_eq!(meta.outbound_proxy, Some(OutboundProxyMode::Direct));
+        assert!(meta.forces_direct_outbound());
+    }
+
+    /// The override must round-trip through the provider config file, and an
+    /// unset value must not be written at all so stored configs stay unchanged
+    /// for users who never touch the new switch.
+    #[test]
+    fn outbound_proxy_serialization_round_trip() {
+        let direct = ProviderMeta {
+            outbound_proxy: Some(OutboundProxyMode::Direct),
+            ..ProviderMeta::default()
+        };
+        let value = serde_json::to_value(&direct).unwrap();
+        assert_eq!(value.get("outboundProxy"), Some(&json!("direct")));
+
+        let parsed: ProviderMeta = serde_json::from_value(value).unwrap();
+        assert!(parsed.forces_direct_outbound());
+
+        let unset = ProviderMeta::default();
+        let value = serde_json::to_value(&unset).unwrap();
+        assert!(value.get("outboundProxy").is_none());
+    }
 
     #[test]
     fn proxy_injected_oauth_excludes_codex_oauth() {
