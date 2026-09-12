@@ -23,6 +23,29 @@ name: Release (Windows x64, unsigned)
 #   * Requests `contents: write` explicitly, because this repository keeps the
 #     default GITHUB_TOKEN permission at "read".
 #
+# WHY THE OVERLAY ALSO CLEARS THE UPDATER ENDPOINTS
+#   This fork exists to carry patches that upstream does not have (currently the
+#   per-provider outbound proxy switch). tauri.conf.json ships the upstream
+#   updater endpoints (dl.ccswitch.io, and upstream's own GitHub Releases), and
+#   the fork inherits upstream's updater pubkey -- so an installed self-built
+#   binary happily offers the official release, and accepting it REPLACES the
+#   binary and silently discards the patches. The overlay therefore sets
+#   plugins.updater.endpoints = [].
+#
+#   This is the safe way to switch the updater off:
+#     - Config merge is json_patch/JSON Merge Patch semantics (RFC 7386), so an
+#       array in the overlay REPLACES the base array instead of appending to it.
+#     - The plugin still registers, because `pubkey` keeps its value and
+#       tauri-plugin-updater validates nothing about endpoints at setup time.
+#       (Removing `pubkey` instead would make plugin setup fail, and any later
+#       `app.updater_builder()` panics on the missing plugin state.)
+#     - `Updater::build()` then returns Error::EmptyEndpoints at check time, so
+#       nothing panics: the launch-time auto check only logs to the webview
+#       console, and a manual "Check for Updates" click shows a clear failure
+#       toast rather than inventing an "up to date" answer.
+#   To re-enable upstream updates, delete the plugins.updater block from the
+#   overlay -- nothing else in this workflow depends on it.
+#
 # HOW TO RUN
 #   1. Actions -> "Release (Windows x64, unsigned)" -> Run workflow
 #      Builds and attaches the files to the run (no GitHub Release).
@@ -143,6 +166,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           # --bundles must stay quoted: PowerShell would otherwise expand
           # "msi,nsis" into two separate arguments.
+          #
+          # --config merges tauri.unsigned.conf.json into tauri.conf.json
+          # (later values win, arrays are replaced) and carries two overrides:
+          #   bundle.createUpdaterArtifacts=false -> no minisign key needed
+          #   plugins.updater.endpoints=[]        -> self-built binary can never
+          #                                          install the official release
+          #                                          over these fork patches
           pnpm tauri build --bundles "msi,nsis" --config src-tauri/tauri.unsigned.conf.json
 
       - name: Prepare Windows assets
@@ -231,6 +261,11 @@ jobs:
             - `bundle.createUpdaterArtifacts` is disabled in this build, so no
               `.sig` / `latest.json` is published and the Tauri auto-updater
               cannot be fed from this Release.
+            - The in-app updater is switched off on purpose
+              (`plugins.updater.endpoints` is empty). This fork carries patches
+              upstream does not have, and letting the app update itself would
+              install the official build over them. "Check for Updates" will
+              therefore report a failure instead of offering an upgrade.
             - Built from commit `${{ github.sha }}`.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
