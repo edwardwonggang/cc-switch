@@ -39,6 +39,26 @@ use tokio::sync::RwLock;
 
 const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 
+/// How long to wait before re-issuing a request that the upstream rejected with HTTP 429.
+///
+/// Deliberately a flat delay instead of honouring `Retry-After`: by the time a 429 reaches
+/// this layer it has already been flattened into `ProxyError::UpstreamError { status, body }`,
+/// which carries no response headers (see `proxy/error.rs`). Corporate gateways are rate
+/// limited on a per-minute window in practice, so 60s is the smallest wait that reliably
+/// crosses a window boundary.
+const RATE_LIMIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many extra attempts the *same* provider gets after a 429, before the failure is
+/// handed back to the normal failover path.
+///
+/// Kept separate from `AppProxyConfig::max_retries`, which counts *providers*: a
+/// single-provider setup — the common corporate case — has nothing to fail over to, so
+/// without an in-place retry the 429 is passed straight through to the client. Codex then
+/// exhausts its own `request_max_retries` (default 4, ~15s of backoff) and prints
+/// "exceeded retry limit, last status: 429", which also halts a running `/goal`
+/// (goal continuation stops on a usage limit since Codex 0.132.0).
+const RATE_LIMIT_RETRY_ATTEMPTS: usize = 3;
+
 fn codex_bearer_access_token(headers: &http::HeaderMap) -> Option<&str> {
     let authorization = headers
         .get(http::header::AUTHORIZATION)?
@@ -188,6 +208,12 @@ pub struct RequestForwarder {
     /// `max_attempts = max_retries + 1`，所以 max_retries=0 表示仅尝试一家、
     /// max_retries=3（默认）表示最多 4 家。loop 同时受 providers.len() 自然限制。
     max_attempts: usize,
+    /// Delay applied before re-issuing a request against the *same* provider after a 429.
+    ///
+    /// Exposed as a field rather than read directly from `RATE_LIMIT_RETRY_DELAY` so the
+    /// unit tests can drive the retry loop with a zero delay; production always uses the
+    /// constant (see `RequestForwarder::new`).
+    rate_limit_retry_delay: std::time::Duration,
 }
 
 impl RequestForwarder {
@@ -278,6 +304,7 @@ impl RequestForwarder {
                 streaming_first_byte_timeout,
             ),
             max_attempts,
+            rate_limit_retry_delay: RATE_LIMIT_RETRY_DELAY,
         }
     }
 
@@ -524,9 +551,11 @@ impl RequestForwarder {
                 status.current_provider_id = Some(provider.id.clone());
             }
 
-            // 转发请求（每个 Provider 只尝试一次，重试由客户端控制）
+            // 转发请求。除 429 外，每个 Provider 只尝试一次（重试由客户端控制）；
+            // 429 由 forward_with_rate_limit_retry 在同 provider 上等待后原地重试，
+            // 因为它不是"换一家能解决"的错误。
             match self
-                .forward(
+                .forward_with_rate_limit_retry(
                     app_type,
                     &method,
                     provider,
@@ -1153,6 +1182,75 @@ impl RequestForwarder {
             error: last_error.unwrap_or(ProxyError::MaxRetriesExceeded),
             provider: last_provider,
         })
+    }
+
+    /// In-place retry delay for a failed attempt, or `None` when the error must be surfaced.
+    ///
+    /// Only HTTP 429 is retried in place. Every other error — including the other
+    /// `Retryable` classes such as 5xx and timeouts — keeps the original failover
+    /// behaviour untouched, and once the per-provider budget
+    /// (`RATE_LIMIT_RETRY_ATTEMPTS`) is used up the 429 falls through to the normal
+    /// classification path so multi-provider setups can still switch provider.
+    fn rate_limit_retry_wait(
+        &self,
+        error: &ProxyError,
+        retries_done: usize,
+    ) -> Option<std::time::Duration> {
+        let is_rate_limited = matches!(error, ProxyError::UpstreamError { status: 429, .. });
+        (is_rate_limited && retries_done < RATE_LIMIT_RETRY_ATTEMPTS)
+            .then_some(self.rate_limit_retry_delay)
+    }
+
+    /// Forward to one provider, waiting and retrying that same provider while it answers 429.
+    ///
+    /// Motivation: `forward_with_retry_inner` classifies a 429 as `Retryable`, but "retryable"
+    /// there only means "try the next provider" — with no sleep at all and, in a
+    /// single-provider setup, no next provider to switch to. The 429 therefore reaches Codex
+    /// verbatim. Sleeping here absorbs the rate limit *below* Codex, so Codex never sees a
+    /// usage limit and a running `/goal` keeps auto-continuing instead of stalling.
+    ///
+    /// Safety: this wraps `forward()`, which returns either a complete `ProxyResponse` or an
+    /// error. Nothing has been written to the client at this point, so sleeping and re-issuing
+    /// cannot corrupt an in-flight SSE stream.
+    #[allow(clippy::too_many_arguments)]
+    async fn forward_with_rate_limit_retry(
+        &self,
+        app_type: &AppType,
+        method: &http::Method,
+        provider: &Provider,
+        endpoint: &str,
+        body: &Value,
+        headers: &axum::http::HeaderMap,
+        extensions: &Extensions,
+        adapter: &dyn ProviderAdapter,
+    ) -> Result<(ProxyResponse, Option<String>, Option<String>), ProxyError> {
+        let mut retries_done = 0usize;
+        loop {
+            let result = self
+                .forward(
+                    app_type, method, provider, endpoint, body, headers, extensions, adapter,
+                )
+                .await;
+
+            let wait = match &result {
+                Err(error) => self.rate_limit_retry_wait(error, retries_done),
+                Ok(_) => None,
+            };
+            let Some(wait) = wait else {
+                return result;
+            };
+
+            retries_done += 1;
+            log::warn!(
+                "[{}] Upstream rate limited (HTTP 429) on provider={}, waiting {}s before in-place retry {}/{}",
+                app_type.as_str(),
+                provider.id,
+                wait.as_secs(),
+                retries_done,
+                RATE_LIMIT_RETRY_ATTEMPTS
+            );
+            tokio::time::sleep(wait).await;
+        }
     }
 
     /// 转发单个请求（使用适配器）
@@ -3936,7 +4034,59 @@ mod tests {
             non_streaming_timeout,
             streaming_first_byte_timeout,
             max_attempts: 1,
+            rate_limit_retry_delay: RATE_LIMIT_RETRY_DELAY,
         }
+    }
+
+    #[test]
+    fn rate_limit_retry_applies_only_to_429_and_is_bounded() {
+        let mut forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+
+        let rate_limited = ProxyError::UpstreamError {
+            status: 429,
+            body: Some(r#"{"error":{"message":"rate limit exceeded"}}"#.to_string()),
+        };
+
+        // 429 waits, up to the per-provider budget, then falls through to the normal path.
+        assert_eq!(
+            forwarder.rate_limit_retry_wait(&rate_limited, 0),
+            Some(RATE_LIMIT_RETRY_DELAY)
+        );
+        assert_eq!(
+            forwarder.rate_limit_retry_wait(&rate_limited, RATE_LIMIT_RETRY_ATTEMPTS - 1),
+            Some(RATE_LIMIT_RETRY_DELAY)
+        );
+        assert_eq!(
+            forwarder.rate_limit_retry_wait(&rate_limited, RATE_LIMIT_RETRY_ATTEMPTS),
+            None
+        );
+
+        // Every other error keeps the original failover behaviour — no in-place waiting.
+        for error in [
+            ProxyError::UpstreamError {
+                status: 503,
+                body: None,
+            },
+            ProxyError::UpstreamError {
+                status: 400,
+                body: None,
+            },
+            ProxyError::UpstreamError {
+                status: 408,
+                body: None,
+            },
+            ProxyError::Timeout("upstream timed out".to_string()),
+            ProxyError::ForwardFailed("connection reset by peer".to_string()),
+        ] {
+            assert_eq!(forwarder.rate_limit_retry_wait(&error, 0), None);
+        }
+
+        // The wait is read from the field, so tests can neutralise the 60s sleep.
+        forwarder.rate_limit_retry_delay = Duration::ZERO;
+        assert_eq!(
+            forwarder.rate_limit_retry_wait(&rate_limited, 0),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
