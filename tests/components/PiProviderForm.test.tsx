@@ -12,6 +12,10 @@ import { PiProviderForm } from "@/components/providers/forms/PiProviderForm";
 import { http, HttpResponse } from "msw";
 import { server } from "../msw/server";
 
+// Pi 表单的多数用例是长 userEvent 交互流，在 CI 并行负载下常超过 vitest 默认
+// 5000ms 而超时。这里统一放宽到 15s，避免偶发超时导致 CI 失败。
+vi.setConfig({ testTimeout: 15000 });
+
 const TAURI_ENDPOINT = "http://tauri.local";
 
 function completeModel(id: string, name = id.trim() || "Model") {
