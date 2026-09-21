@@ -96,6 +96,8 @@ const renderCopilotForm = (overrides: Partial<ClaudeFormFieldsProps> = {}) => {
     onFullUrlChange: vi.fn(),
     customUserAgent: "",
     onCustomUserAgentChange: vi.fn(),
+    useGlobalOutboundProxy: false,
+    onUseGlobalOutboundProxyChange: vi.fn(),
     localProxyHeadersOverride: "",
     onLocalProxyHeadersOverrideChange: vi.fn(),
     localProxyBodyOverride: "",

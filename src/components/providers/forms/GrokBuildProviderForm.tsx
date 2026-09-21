@@ -138,6 +138,9 @@ export function GrokBuildProviderForm({
   const [customUserAgent, setCustomUserAgent] = useState(
     initialData?.meta?.customUserAgent ?? "",
   );
+  const [useGlobalOutboundProxy, setUseGlobalOutboundProxy] = useState<boolean>(
+    () => initialData?.meta?.outboundProxy !== "direct",
+  );
   const [headersOverride, setHeadersOverride] = useState(
     formatRequestOverrideObject(
       initialData?.meta?.localProxyRequestOverrides?.headers,
@@ -394,6 +397,12 @@ export function GrokBuildProviderForm({
       promptCacheRouting,
       codexChatReasoning,
       customUserAgent: customUserAgent.trim() || undefined,
+      // Plan A: persist only the non-default case; writing `undefined` when the
+      // switch is ON keeps existing configs, presets and deeplinks untouched.
+      outboundProxy:
+        category !== "official" && !useGlobalOutboundProxy
+          ? "direct"
+          : undefined,
       localProxyRequestOverrides: requestOverrides.overrides,
       maxOutputTokens:
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
@@ -489,6 +498,8 @@ export function GrokBuildProviderForm({
               speedTestEndpoints={speedTestEndpoints}
               customUserAgent={customUserAgent}
               onCustomUserAgentChange={setCustomUserAgent}
+              useGlobalOutboundProxy={useGlobalOutboundProxy}
+              onUseGlobalOutboundProxyChange={setUseGlobalOutboundProxy}
               localProxyHeadersOverride={headersOverride}
               onLocalProxyHeadersOverrideChange={setHeadersOverride}
               localProxyBodyOverride={bodyOverride}
