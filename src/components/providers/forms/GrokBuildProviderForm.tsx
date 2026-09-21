@@ -399,10 +399,8 @@ export function GrokBuildProviderForm({
       customUserAgent: customUserAgent.trim() || undefined,
       // Plan A: persist only the non-default case; writing `undefined` when the
       // switch is ON keeps existing configs, presets and deeplinks untouched.
-      outboundProxy:
-        category !== "official" && !useGlobalOutboundProxy
-          ? "direct"
-          : undefined,
+      // 此分支已在 handleSubmit 开头过滤掉官方条目，category 必为非 official。
+      outboundProxy: !useGlobalOutboundProxy ? "direct" : undefined,
       localProxyRequestOverrides: requestOverrides.overrides,
       maxOutputTokens:
         Number.isInteger(parsedMaxOutputTokens) && parsedMaxOutputTokens > 0
