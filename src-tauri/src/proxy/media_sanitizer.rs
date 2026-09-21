@@ -93,6 +93,26 @@ pub fn is_unsupported_image_error(error: &ProxyError) -> bool {
         return false;
     }
 
+    // 自证性模态拒绝：文案本身断言模型不支持多模态/图像/视觉。
+    // 常见于第三方 MaaS 网关（例如 "deepseek-v4-flash-0731 is not a
+    // multimodal model"），不依赖 "not supported" 等固定措辞。
+    const MULTIMODAL_DENIAL_HINTS: &[&str] = &[
+        "not a multimodal",
+        "not multimodal",
+        "does not support multimodal",
+        "does not support image",
+        "does not support vision",
+        "is not a vision model",
+        "does not accept image",
+        "does not accept vision",
+    ];
+    if MULTIMODAL_DENIAL_HINTS
+        .iter()
+        .any(|hint| message.contains(hint))
+    {
+        return true;
+    }
+
     const UNSUPPORTED_HINTS: &[&str] = &[
         "unsupported",
         "not supported",
@@ -1162,6 +1182,21 @@ mod tests {
             status: 400,
             body: Some(
                 r#"{"error":{"message":"This model does not support image input"}}"#.to_string(),
+            ),
+        };
+
+        assert!(is_unsupported_image_error(&error));
+    }
+
+    #[test]
+    fn detects_not_multimodal_model_error() {
+        // 第三方 MaaS 网关真实报错：deepseek-v4-flash 在 zte 网关仍是纯文本，
+        // 返回 "deepseek-v4-flash-0731 is not a multimodal model"（HTTP 400）。
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                r#"{"error":{"message":"deepseek-v4-flash-0731 is not a multimodal model"}}"#
+                    .to_string(),
             ),
         };
 
