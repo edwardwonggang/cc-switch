@@ -1431,7 +1431,7 @@ where
 
     let mut items: Vec<Result<Bytes, std::io::Error>> = buffered
         .into_iter()
-        .map(|b| Ok::<Bytes, std::io::Error>(b))
+        .map(Ok::<Bytes, std::io::Error>)
         .collect();
     if let Some(e) = upstream_err {
         items.push(Err(e));
