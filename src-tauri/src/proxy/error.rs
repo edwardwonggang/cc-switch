@@ -48,6 +48,9 @@ pub enum ProxyError {
     #[error("超过最大重试次数")]
     MaxRetriesExceeded,
 
+    #[error("检测到模型输出重复循环，已中止上游请求")]
+    RepeatLoopDetected,
+
     #[error("数据库错误: {0}")]
     DatabaseError(String),
 
@@ -142,6 +145,9 @@ impl IntoResponse for ProxyError {
                     }
                     ProxyError::MaxRetriesExceeded => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
+                    }
+                    ProxyError::RepeatLoopDetected => {
+                        (StatusCode::BAD_GATEWAY, self.to_string())
                     }
                     ProxyError::DatabaseError(_) => {
                         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())

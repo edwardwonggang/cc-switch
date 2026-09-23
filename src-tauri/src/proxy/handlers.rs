@@ -40,8 +40,9 @@ use super::{
         read_decoded_body, strip_entity_headers_for_rebuilt_body,
         strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
     },
+    repeat_detector::RepeatDetector,
     server::ProxyState,
-    sse::{strip_sse_field, take_sse_block},
+    sse::{append_utf8_safe, strip_sse_field, take_sse_block},
     types::*,
     usage::parser::TokenUsage,
     ProxyError,
@@ -1328,6 +1329,116 @@ async fn handle_codex_xai_native_responses_rewrite(
         })
 }
 
+/// 前置短缓冲采样的文本字符预算：达到该预算仍未检测到重复循环即放行。
+///
+/// 权衡：窗口越大越能捕获「正常前缀较长、随后才循环」的退化，但会增加首 token
+/// 延迟。deepseek-v4-flash 的退化通常在前几百字符内即出现连续重复，取 1200 字符
+/// 在可靠性与延迟间取得平衡。
+const REPEAT_SAMPLE_TEXT_CHARS: usize = 1200;
+
+/// 前置采样原始字节硬上限，防止异常情况下占用过多内存。
+const REPEAT_SAMPLE_MAX_BYTES: usize = 8192;
+
+/// 从单个 SSE 块中提取 Chat Completions 增量文本（content + reasoning_content）。
+///
+/// 与 `streaming_codex_chat` 的 delta 解析保持一致，供重复循环检测器使用。
+fn extract_chat_delta_text(block: &str) -> Option<String> {
+    let data_parts: Vec<&str> = block
+        .lines()
+        .filter_map(|line| strip_sse_field(line, "data"))
+        .collect();
+    if data_parts.is_empty() {
+        return None;
+    }
+
+    let data = data_parts.join("\n");
+    if data.trim() == "[DONE]" {
+        return None;
+    }
+
+    let value: Value = serde_json::from_str(&data).ok()?;
+    let delta = value.get("choices")?.as_array()?.first()?.get("delta")?;
+
+    let mut text = String::new();
+    if let Some(content) = delta.get("content").and_then(|v| v.as_str()) {
+        text.push_str(content);
+    }
+    if let Some(reasoning) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+        text.push_str(reasoning);
+    }
+
+    (!text.is_empty()).then_some(text)
+}
+
+/// 在构造流式响应前对上游流做前置短缓冲重复检测。
+///
+/// 主动读取上游前一小段增量文本喂给 [`RepeatDetector`]：一旦判定出现重复生成循环，
+/// 立即返回 [`ProxyError::RepeatLoopDetected`]（HTTP 502），让 Codex 在首字节前收到
+/// 错误并自动重试同一提示词；否则把已缓冲的原始字节与剩余流拼接后原样透传。
+async fn codex_chat_preflight_repeat_detection<S>(
+    stream: S,
+) -> Result<impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send, ProxyError>
+where
+    S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
+{
+    let mut stream = Box::pin(stream);
+    let mut buffered: Vec<Bytes> = Vec::new();
+    let mut sample_bytes = 0usize;
+    let mut sample_text_chars = 0usize;
+    let mut sse_buffer = String::new();
+    let mut utf8_remainder: Vec<u8> = Vec::new();
+    let mut detector = RepeatDetector::new();
+    let mut loop_detected = false;
+    let mut upstream_err: Option<std::io::Error> = None;
+
+    while sample_text_chars < REPEAT_SAMPLE_TEXT_CHARS && sample_bytes < REPEAT_SAMPLE_MAX_BYTES {
+        match stream.next().await {
+            Some(Ok(bytes)) => {
+                sample_bytes += bytes.len();
+                buffered.push(bytes.clone());
+                append_utf8_safe(&mut sse_buffer, &mut utf8_remainder, &bytes);
+
+                while let Some(block) = take_sse_block(&mut sse_buffer) {
+                    if let Some(text) = extract_chat_delta_text(&block) {
+                        sample_text_chars += text.chars().count();
+                        if detector.push(&text) {
+                            loop_detected = true;
+                            break;
+                        }
+                    }
+                }
+
+                if loop_detected {
+                    break;
+                }
+            }
+            Some(Err(e)) => {
+                upstream_err = Some(e);
+                break;
+            }
+            None => break,
+        }
+    }
+
+    if loop_detected {
+        log::warn!(
+            "[Codex] 检测到上游模型输出重复循环，中止并让客户端重试 (采样 {} bytes, {} chars)",
+            sample_bytes,
+            sample_text_chars
+        );
+        return Err(ProxyError::RepeatLoopDetected);
+    }
+
+    let mut items: Vec<Result<Bytes, std::io::Error>> = buffered
+        .into_iter()
+        .map(|b| Ok::<Bytes, std::io::Error>(b))
+        .collect();
+    if let Some(e) = upstream_err {
+        items.push(Err(e));
+    }
+    Ok(futures::stream::iter(items).chain(stream))
+}
+
 async fn handle_codex_chat_to_responses_transform(
     response: super::hyper_client::ProxyResponse,
     ctx: &RequestContext,
@@ -1346,7 +1457,7 @@ async fn handle_codex_chat_to_responses_transform(
     }
 
     if is_stream || response.is_sse() {
-        let stream = response.bytes_stream();
+        let stream = codex_chat_preflight_repeat_detection(response.bytes_stream()).await?;
         let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
