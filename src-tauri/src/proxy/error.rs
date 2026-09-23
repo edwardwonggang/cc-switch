@@ -146,9 +146,7 @@ impl IntoResponse for ProxyError {
                     ProxyError::MaxRetriesExceeded => {
                         (StatusCode::SERVICE_UNAVAILABLE, self.to_string())
                     }
-                    ProxyError::RepeatLoopDetected => {
-                        (StatusCode::BAD_GATEWAY, self.to_string())
-                    }
+                    ProxyError::RepeatLoopDetected => (StatusCode::BAD_GATEWAY, self.to_string()),
                     ProxyError::DatabaseError(_) => {
                         (StatusCode::INTERNAL_SERVER_ERROR, self.to_string())
                     }

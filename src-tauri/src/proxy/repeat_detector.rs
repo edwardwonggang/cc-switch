@@ -93,8 +93,12 @@ impl RepeatDetector {
 
         let end = first_end?;
         // 片段 = 从缓冲开头到第一个句末标点（含标点）。
-        let split_at =
-            end + pending[end..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        let split_at = end
+            + pending[end..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
         let segment = pending[..split_at].to_string();
         pending.drain(..split_at);
         Some(segment)

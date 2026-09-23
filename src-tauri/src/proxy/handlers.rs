@@ -35,12 +35,12 @@ use super::{
         transform_codex_responses_namespace, transform_codex_responses_xai_sanitize,
         transform_gemini, transform_responses,
     },
+    repeat_detector::RepeatDetector,
     response_processor::{
         create_logged_passthrough_stream, create_usage_collector, process_response,
         read_decoded_body, strip_entity_headers_for_rebuilt_body,
         strip_hop_by_hop_response_headers, usage_logging_enabled, SseUsageCollector,
     },
-    repeat_detector::RepeatDetector,
     server::ProxyState,
     sse::{append_utf8_safe, strip_sse_field, take_sse_block},
     types::*,
