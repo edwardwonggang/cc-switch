@@ -9,6 +9,7 @@
 //! a direct (non-proxied) CLI request.
 
 use super::{
+    cross_turn_detector::CrossTurnStore,
     failover_switch::FailoverSwitchManager,
     handlers,
     log_codes::srv as log_srv,
@@ -44,6 +45,8 @@ pub struct ProxyState {
     pub gemini_shadow: Arc<GeminiShadowStore>,
     /// Codex Chat bridge history，用于恢复 previous_response_id 指向的 tool call
     pub codex_chat_history: Arc<CodexChatHistoryStore>,
+    /// 跨 turn 车轱辘行动计划检测器状态（按 session 维度，跨请求保持）
+    pub cross_turn_detector: Arc<std::sync::RwLock<CrossTurnStore>>,
     /// AppHandle，用于发射事件和更新托盘菜单
     pub app_handle: Option<tauri::AppHandle>,
     /// 故障转移切换管理器
@@ -79,6 +82,7 @@ impl ProxyServer {
             provider_router,
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            cross_turn_detector: Arc::new(std::sync::RwLock::new(CrossTurnStore::new())),
             app_handle,
             failover_manager,
         };

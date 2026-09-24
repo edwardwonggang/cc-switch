@@ -35,6 +35,7 @@ use super::{
         transform_codex_responses_namespace, transform_codex_responses_xai_sanitize,
         transform_gemini, transform_responses,
     },
+    cross_turn_detector::extract_action_plan_fingerprints,
     repeat_detector::RepeatDetector,
     response_processor::{
         create_logged_passthrough_stream, create_usage_collector, process_response,
@@ -1377,6 +1378,8 @@ fn extract_chat_delta_text(block: &str) -> Option<String> {
 /// 错误并自动重试同一提示词；否则把已缓冲的原始字节与剩余流拼接后原样透传。
 async fn codex_chat_preflight_repeat_detection<S>(
     stream: S,
+    state: &ProxyState,
+    session_id: &str,
 ) -> Result<impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send, ProxyError>
 where
     S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
@@ -1388,6 +1391,7 @@ where
     let mut sse_buffer = String::new();
     let mut utf8_remainder: Vec<u8> = Vec::new();
     let mut detector = RepeatDetector::new();
+    let mut sample_text = String::new();
     let mut loop_detected = false;
     let mut upstream_err: Option<std::io::Error> = None;
 
@@ -1401,6 +1405,7 @@ where
                 while let Some(block) = take_sse_block(&mut sse_buffer) {
                     if let Some(text) = extract_chat_delta_text(&block) {
                         sample_text_chars += text.chars().count();
+                        sample_text.push_str(&text);
                         if detector.push(&text) {
                             loop_detected = true;
                             break;
@@ -1427,6 +1432,24 @@ where
             sample_text_chars
         );
         return Err(ProxyError::RepeatLoopDetected);
+    }
+
+    // 跨 turn 车轱辘行动计划检测：与方案 A 共存，命中返回 RepeatLoopDetectedCrossTurn。
+    {
+        let fingerprints = extract_action_plan_fingerprints(&sample_text);
+        if !fingerprints.is_empty() {
+            let cross_hit = state
+                .cross_turn_detector
+                .write()
+                .map_err(|e| ProxyError::Internal(format!("cross_turn lock poisoned: {e}")))?
+                .check_and_record(session_id, &fingerprints);
+            if cross_hit {
+                log::warn!(
+                    "[Codex] 检测到跨 turn 车轱辘行动计划循环，中止并让客户端重试 (session={session_id}, 指纹={fingerprints:?})"
+                );
+                return Err(ProxyError::RepeatLoopDetectedCrossTurn);
+            }
+        }
     }
 
     let mut items: Vec<Result<Bytes, std::io::Error>> = buffered
@@ -1457,7 +1480,9 @@ async fn handle_codex_chat_to_responses_transform(
     }
 
     if is_stream || response.is_sse() {
-        let stream = codex_chat_preflight_repeat_detection(response.bytes_stream()).await?;
+        let stream =
+            codex_chat_preflight_repeat_detection(response.bytes_stream(), state, &ctx.session_id)
+                .await?;
         let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
@@ -2150,6 +2175,7 @@ fn codex_proxy_error_code(error: &ProxyError) -> &'static str {
         ProxyError::NoProvidersConfigured => "cc_switch_no_providers_configured",
         ProxyError::MaxRetriesExceeded => "cc_switch_max_retries_exceeded",
         ProxyError::RepeatLoopDetected => "cc_switch_repeat_loop_detected",
+        ProxyError::RepeatLoopDetectedCrossTurn => "cc_switch_repeat_loop_detected_cross_turn",
         ProxyError::ProviderUnhealthy(_) => "cc_switch_provider_unhealthy",
         ProxyError::ConfigError(_) => "cc_switch_config_error",
         ProxyError::TransformError(_) => "cc_switch_transform_error",
