@@ -49,7 +49,7 @@ const EN_ACTION_PREFIXES: &[&str] = &[
 ];
 
 /// 句子切分使用的字符集合。
-const SENTENCE_ENDERS: &[char] = &['.', '!', '?', '。', '！', '？', '；', ';', '\n'];
+const SENTENCE_ENDERS: &[char] = &['!', '?', '。', '！', '？', '；', ';', '\n'];
 
 /// 提取文本中的「行动计划式」自然语言短语指纹。
 ///
@@ -82,12 +82,24 @@ fn is_action_plan_sentence(sentence: &str) -> bool {
 }
 
 /// 把文本按句末标点切分为句子。
+///
+/// 英文句点 `.` 只在「后跟空白或行尾」时才作为句末，避免把文件名/路径里的点
+/// （如 mobile.css、foo.rs）误切成句。
 fn split_sentences(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
     let mut sentences = Vec::new();
     let mut pending = String::new();
-    for ch in text.chars() {
+    for (i, &ch) in chars.iter().enumerate() {
         pending.push(ch);
-        if SENTENCE_ENDERS.contains(&ch) {
+        let next = chars.get(i + 1).copied();
+        let is_ender = match ch {
+            '.' => match next {
+                None => true,
+                Some(n) => n.is_whitespace(),
+            },
+            _ => SENTENCE_ENDERS.contains(&ch),
+        };
+        if is_ender {
             sentences.push(std::mem::take(&mut pending));
         }
     }
@@ -276,9 +288,8 @@ mod tests {
         let text = "让我用 Python 打印 mobile.css 405-525 和 795-805 行。让我执行。";
         let fps = extract_action_plan_fingerprints(text);
         assert_eq!(fps.len(), 1, "只应提取出完整行动计划句: {fps:?}");
-        // `.` 也是句末切分符，`mobile.css` 中的点号会把句子截断，但仍提取出
-        // 核心动作意图骨架，足以用于跨消息匹配。
-        assert_eq!(fps[0], "让我用 python 打印 mobile");
+        // 英文句点只在后跟空白或行尾时断句，mobile.css 中的点不会截断句子。
+        assert_eq!(fps[0], "让我用 python 打印 mobile css 和 行");
     }
 
     #[test]
@@ -317,9 +328,9 @@ mod tests {
     fn normalization_makes_similar_action_plans_match() {
         // 归一化前仅行号/数值不同，归一化后应一致，从而跨消息命中。
         let a =
-            extract_action_plan_fingerprints("让我用 Python 打印 mobile css 405-525 和 795-805 行");
+            extract_action_plan_fingerprints("让我用 Python 打印 mobile.css 405-525 和 795-805 行");
         let b =
-            extract_action_plan_fingerprints("让我用 Python 打印 mobile css 100-200 和 300-400 行");
+            extract_action_plan_fingerprints("让我用 Python 打印 mobile.css 100-200 和 300-400 行");
         assert_eq!(a, b, "仅行号不同，归一化后指纹应一致");
         assert!(is_highly_similar(&a[0], &b[0]));
     }
