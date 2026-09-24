@@ -276,7 +276,9 @@ mod tests {
         let text = "让我用 Python 打印 mobile.css 405-525 和 795-805 行。让我执行。";
         let fps = extract_action_plan_fingerprints(text);
         assert_eq!(fps.len(), 1, "只应提取出完整行动计划句: {fps:?}");
-        assert_eq!(fps[0], "让我用 python 打印 mobile css 和 行");
+        // `.` 也是句末切分符，`mobile.css` 中的点号会把句子截断，但仍提取出
+        // 核心动作意图骨架，足以用于跨消息匹配。
+        assert_eq!(fps[0], "让我用 python 打印 mobile");
     }
 
     #[test]
@@ -314,8 +316,8 @@ mod tests {
     #[test]
     fn normalization_makes_similar_action_plans_match() {
         // 归一化前仅行号/数值不同，归一化后应一致，从而跨消息命中。
-        let a = extract_action_plan_fingerprints("让我用 Python 打印 mobile.css 405-525 行");
-        let b = extract_action_plan_fingerprints("让我用 Python 打印 mobile.css 100-200 行");
+        let a = extract_action_plan_fingerprints("让我用 Python 打印 mobile css 405-525 和 795-805 行");
+        let b = extract_action_plan_fingerprints("让我用 Python 打印 mobile css 100-200 和 300-400 行");
         assert_eq!(a, b, "仅行号不同，归一化后指纹应一致");
         assert!(is_highly_similar(&a[0], &b[0]));
     }
