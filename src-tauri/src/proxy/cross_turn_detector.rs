@@ -316,8 +316,10 @@ mod tests {
     #[test]
     fn normalization_makes_similar_action_plans_match() {
         // 归一化前仅行号/数值不同，归一化后应一致，从而跨消息命中。
-        let a = extract_action_plan_fingerprints("让我用 Python 打印 mobile css 405-525 和 795-805 行");
-        let b = extract_action_plan_fingerprints("让我用 Python 打印 mobile css 100-200 和 300-400 行");
+        let a =
+            extract_action_plan_fingerprints("让我用 Python 打印 mobile css 405-525 和 795-805 行");
+        let b =
+            extract_action_plan_fingerprints("让我用 Python 打印 mobile css 100-200 和 300-400 行");
         assert_eq!(a, b, "仅行号不同，归一化后指纹应一致");
         assert!(is_highly_similar(&a[0], &b[0]));
     }
