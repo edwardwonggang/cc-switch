@@ -71,16 +71,14 @@ pub(crate) fn extract_action_plan_fingerprints(text: &str) -> Vec<String> {
 }
 
 /// 判断一个句子是否带动作意图（祈使/行动计划）前缀。
+///
+/// 中文与英文一致，只匹配句首动作意图词，避免把叙述句中间出现的
+/// 「让我/我来/我要」误判为行动计划。
 fn is_action_plan_sentence(sentence: &str) -> bool {
-    let lower = sentence.to_lowercase();
-    if CN_ACTION_PREFIXES
-        .iter()
-        .any(|p| lower.starts_with(p) || lower.contains(p))
-    {
-        return true;
-    }
-    let lower = lower.trim_start();
-    EN_ACTION_PREFIXES.iter().any(|p| lower.starts_with(p))
+    let lower = sentence.trim_start().to_lowercase();
+    let cn_hit = CN_ACTION_PREFIXES.iter().any(|p| lower.starts_with(p));
+    let en_hit = EN_ACTION_PREFIXES.iter().any(|p| lower.starts_with(p));
+    cn_hit || en_hit
 }
 
 /// 把文本按句末标点切分为句子。
@@ -311,6 +309,27 @@ mod tests {
         // 完全不同的行动计划不应误判。
         let c = "让我检查电机接触器状态".to_string();
         assert!(!is_highly_similar(&a, &c));
+    }
+
+    #[test]
+    fn normalization_makes_similar_action_plans_match() {
+        // 归一化前仅行号/数值不同，归一化后应一致，从而跨消息命中。
+        let a = extract_action_plan_fingerprints("让我用 Python 打印 mobile.css 405-525 行");
+        let b = extract_action_plan_fingerprints("让我用 Python 打印 mobile.css 100-200 行");
+        assert_eq!(a, b, "仅行号不同，归一化后指纹应一致");
+        assert!(is_highly_similar(&a[0], &b[0]));
+    }
+
+    #[test]
+    fn let_me_call_write_stdin_triggers_cross_turn() {
+        // Mac seq=539 真实样本：同一条行动计划句跨 3 条消息应命中 CrossTurn。
+        let mut store = CrossTurnStore::new();
+        let session = "sess-write-stdin";
+        let fp = extract_action_plan_fingerprints("Let me call write_stdin.");
+        assert!(!fp.is_empty());
+        assert!(!store.check_and_record(session, &fp));
+        assert!(!store.check_and_record(session, &fp));
+        assert!(store.check_and_record(session, &fp));
     }
 
     #[test]

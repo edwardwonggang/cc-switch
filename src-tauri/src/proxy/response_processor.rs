@@ -4,6 +4,7 @@
 
 use super::{
     content_encoding::{decompress_body_with_limit, get_content_encoding, DecompressError},
+    cross_turn_detector::CrossTurnStore,
     forwarder::ActiveConnectionGuard,
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
@@ -1028,6 +1029,7 @@ mod tests {
             provider_router: Arc::new(ProviderRouter::new(db.clone())),
             gemini_shadow: Arc::new(GeminiShadowStore::default()),
             codex_chat_history: Arc::new(CodexChatHistoryStore::default()),
+            cross_turn_detector: Arc::new(std::sync::RwLock::new(CrossTurnStore::new())),
             app_handle: None,
             failover_manager: Arc::new(FailoverSwitchManager::new(db)),
         }

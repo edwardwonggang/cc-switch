@@ -1438,6 +1438,10 @@ where
     {
         let fingerprints = extract_action_plan_fingerprints(&sample_text);
         if !fingerprints.is_empty() {
+            log::debug!(
+                "[Codex] 跨 turn 检测: session={session_id}, 指纹数={}",
+                fingerprints.len()
+            );
             let cross_hit = state
                 .cross_turn_detector
                 .write()
