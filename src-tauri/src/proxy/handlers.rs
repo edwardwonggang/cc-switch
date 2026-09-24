@@ -9,6 +9,7 @@
 
 use super::{
     content_encoding::{decompress_body, get_content_encoding, is_supported_content_encoding},
+    cross_turn_detector::extract_action_plan_fingerprints,
     error_mapper::{get_error_message, map_proxy_error_to_status},
     forwarder::ActiveConnectionGuard,
     handler_config::{
@@ -35,7 +36,6 @@ use super::{
         transform_codex_responses_namespace, transform_codex_responses_xai_sanitize,
         transform_gemini, transform_responses,
     },
-    cross_turn_detector::extract_action_plan_fingerprints,
     repeat_detector::RepeatDetector,
     response_processor::{
         create_logged_passthrough_stream, create_usage_collector, process_response,

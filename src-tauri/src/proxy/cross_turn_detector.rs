@@ -30,14 +30,7 @@ pub(crate) const SIMILARITY_THRESHOLD: f64 = 0.85;
 pub(crate) const MIN_PHRASE_CHARS: usize = 12;
 
 /// 中文动作意图起始词。
-const CN_ACTION_PREFIXES: &[&str] = &[
-    "让我",
-    "我来",
-    "我要",
-    "我需要",
-    "下一步",
-    "现在来",
-];
+const CN_ACTION_PREFIXES: &[&str] = &["让我", "我来", "我要", "我需要", "下一步", "现在来"];
 
 /// 英文动作意图起始词。
 const EN_ACTION_PREFIXES: &[&str] = &[
