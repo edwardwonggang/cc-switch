@@ -4,7 +4,6 @@
 
 use super::{
     content_encoding::{decompress_body_with_limit, get_content_encoding, DecompressError},
-    cross_turn_detector::CrossTurnStore,
     forwarder::ActiveConnectionGuard,
     handler_config::{StreamUsageEventFilter, UsageParserConfig},
     handler_context::{RequestContext, StreamingTimeoutConfig},
@@ -859,6 +858,7 @@ mod tests {
     use crate::database::Database;
     use crate::error::AppError;
     use crate::provider::ProviderMeta;
+    use crate::proxy::cross_turn_detector::CrossTurnStore;
     use crate::proxy::failover_switch::FailoverSwitchManager;
     use crate::proxy::provider_router::ProviderRouter;
     use crate::proxy::providers::{
