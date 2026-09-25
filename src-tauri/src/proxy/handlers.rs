@@ -55,6 +55,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::pin::Pin;
 
 // ============================================================================
 // 健康检查和状态查询（简单端点）
@@ -1340,6 +1341,21 @@ const REPEAT_SAMPLE_TEXT_CHARS: usize = 1200;
 /// 前置采样原始字节硬上限，防止异常情况下占用过多内存。
 const REPEAT_SAMPLE_MAX_BYTES: usize = 8192;
 
+/// 仅对实际连接到 zte 网关的 Codex provider 启用重复输出截断。
+fn is_zte_codex_provider(ctx: &RequestContext) -> bool {
+    if ctx.app_type != AppType::Codex {
+        return false;
+    }
+
+    let Some(adapter) = get_adapter(&AppType::Codex) else {
+        return false;
+    };
+    adapter
+        .extract_base_url(&ctx.provider)
+        .ok()
+        .is_some_and(|base_url| base_url.to_ascii_lowercase().contains("zte"))
+}
+
 /// 从单个 SSE 块中提取 Chat Completions 增量文本（content + reasoning_content）。
 ///
 /// 与 `streaming_codex_chat` 的 delta 解析保持一致，供重复循环检测器使用。
@@ -1374,13 +1390,14 @@ fn extract_chat_delta_text(block: &str) -> Option<String> {
 /// 在构造流式响应前对上游流做前置短缓冲重复检测。
 ///
 /// 主动读取上游前一小段增量文本喂给 [`RepeatDetector`]：一旦判定出现重复生成循环，
-/// 立即返回 [`ProxyError::RepeatLoopDetected`]（HTTP 502），让 Codex 在首字节前收到
-/// 错误并自动重试同一提示词；否则把已缓冲的原始字节与剩余流拼接后原样透传。
+/// 发现循环时，zte provider 截断为安全前缀并正常结束；其它 provider 仍返回 502
+/// 让 Codex 自动重试。未命中时把已缓冲的原始字节与剩余流拼接后原样透传。
 async fn codex_chat_preflight_repeat_detection<S>(
     stream: S,
     state: &ProxyState,
     session_id: &str,
-) -> Result<impl futures::Stream<Item = Result<Bytes, std::io::Error>> + Send, ProxyError>
+    truncate_repeats: bool,
+) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>, ProxyError>
 where
     S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
@@ -1393,6 +1410,7 @@ where
     let mut detector = RepeatDetector::new();
     let mut sample_text = String::new();
     let mut loop_detected = false;
+    let mut safe_blocks: Vec<Bytes> = Vec::new();
     let mut upstream_err: Option<std::io::Error> = None;
 
     while sample_text_chars < REPEAT_SAMPLE_TEXT_CHARS && sample_bytes < REPEAT_SAMPLE_MAX_BYTES {
@@ -1403,6 +1421,7 @@ where
                 append_utf8_safe(&mut sse_buffer, &mut utf8_remainder, &bytes);
 
                 while let Some(block) = take_sse_block(&mut sse_buffer) {
+                    let block_bytes = Bytes::from(format!("{block}\n\n"));
                     if let Some(text) = extract_chat_delta_text(&block) {
                         sample_text_chars += text.chars().count();
                         sample_text.push_str(&text);
@@ -1410,6 +1429,9 @@ where
                             loop_detected = true;
                             break;
                         }
+                    }
+                    if truncate_repeats {
+                        safe_blocks.push(block_bytes);
                     }
                 }
 
@@ -1426,6 +1448,16 @@ where
     }
 
     if loop_detected {
+        if truncate_repeats {
+            log::warn!(
+                "[Codex] zte 上游检测到重复循环，截断重复尾部并正常结束流 (采样 {} bytes, {} chars)",
+                sample_bytes,
+                sample_text_chars
+            );
+            return Ok(Box::pin(futures::stream::iter(
+                safe_blocks.into_iter().map(Ok::<Bytes, std::io::Error>),
+            )));
+        }
         log::warn!(
             "[Codex] 检测到上游模型输出重复循环，中止并让客户端重试 (采样 {} bytes, {} chars)",
             sample_bytes,
@@ -1447,7 +1479,7 @@ where
                 .write()
                 .map_err(|e| ProxyError::Internal(format!("cross_turn lock poisoned: {e}")))?
                 .check_and_record(session_id, &fingerprints);
-            if cross_hit {
+            if cross_hit && !truncate_repeats {
                 log::warn!(
                     "[Codex] 检测到跨 turn 车轱辘行动计划循环，中止并让客户端重试 (session={session_id}, 指纹={fingerprints:?})"
                 );
@@ -1463,7 +1495,7 @@ where
     if let Some(e) = upstream_err {
         items.push(Err(e));
     }
-    Ok(futures::stream::iter(items).chain(stream))
+    Ok(Box::pin(futures::stream::iter(items).chain(stream)))
 }
 
 async fn handle_codex_chat_to_responses_transform(
@@ -1484,9 +1516,13 @@ async fn handle_codex_chat_to_responses_transform(
     }
 
     if is_stream || response.is_sse() {
-        let stream =
-            codex_chat_preflight_repeat_detection(response.bytes_stream(), state, &ctx.session_id)
-                .await?;
+        let stream = codex_chat_preflight_repeat_detection(
+            response.bytes_stream(),
+            state,
+            &ctx.session_id,
+            is_zte_codex_provider(ctx),
+        )
+        .await?;
         let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
