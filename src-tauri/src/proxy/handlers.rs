@@ -55,6 +55,8 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::pin::Pin;
 
 // ============================================================================
@@ -1341,6 +1343,65 @@ const REPEAT_SAMPLE_TEXT_CHARS: usize = 1200;
 /// 前置采样原始字节硬上限，防止异常情况下占用过多内存。
 const REPEAT_SAMPLE_MAX_BYTES: usize = 8192;
 
+/// 重复回复专属日志目录名（位于安装目录父级，如 D:\Programs\cc-switch-repeats）。
+const REPEAT_REPLY_LOG_SUBDIR: &str = "cc-switch-repeats";
+
+/// 检测到重复循环后追加到 AI 回复末尾的压缩提示。
+const REPEAT_REPLY_HINT: &str = "当前对话出现高频重复内容，请压缩后继续回复";
+
+/// 把检测到的模型重复回复写入专属日志目录，文件名使用本地时间（精确到分钟）。
+///
+/// 同一分钟内多次命中会追加到同一文件，返回日志文件路径。
+fn record_repeat_reply(
+    ctx: &RequestContext,
+    sample_text: &str,
+    sample_bytes: usize,
+) -> std::io::Result<std::path::PathBuf> {
+    // 取可执行文件所在目录的上一级（如 D:\Programs），在其下新建专属日志目录；
+    // 该目录独立于安装目录，卸载 cc-switch 不会连带清除。
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+        })
+        .unwrap_or_else(crate::config::get_app_config_dir)
+        .join(REPEAT_REPLY_LOG_SUBDIR);
+    std::fs::create_dir_all(&dir)?;
+    let filename = format!(
+        "repeat-reply-{}.txt",
+        chrono::Local::now().format("%Y%m%d-%H%M")
+    );
+    let path = dir.join(filename);
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+    writeln!(
+        file,
+        "[{}] 检测到模型输出重复循环",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    )?;
+    writeln!(file, "Session: {}", ctx.session_id)?;
+    writeln!(
+        file,
+        "Provider: {} ({})",
+        ctx.provider.id, ctx.provider.name
+    )?;
+    writeln!(file, "Model: {}", ctx.request_model)?;
+    writeln!(file, "采样字节数: {sample_bytes}")?;
+    writeln!(file, "重复样本文本:")?;
+    writeln!(file, "{sample_text}")?;
+    writeln!(file, "---")?;
+    Ok(path)
+}
+
+/// 构造一条追加到响应末尾的 Chat Completions 文本增量，用于向 Codex 提示压缩。
+fn make_repeat_hint_delta(hint: &str) -> String {
+    let encoded = serde_json::to_string(hint).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "data: {{\"choices\":[{{\"index\":0,\"delta\":{{\"content\":{encoded}}},\"finish_reason\":null}}]}}\n\n"
+    )
+}
+
 /// 仅对实际连接到 zte 网关的 Codex provider 启用重复输出截断。
 fn is_zte_codex_provider(ctx: &RequestContext) -> bool {
     if ctx.app_type != AppType::Codex {
@@ -1395,12 +1456,13 @@ fn extract_chat_delta_text(block: &str) -> Option<String> {
 async fn codex_chat_preflight_repeat_detection<S>(
     stream: S,
     state: &ProxyState,
-    session_id: &str,
-    truncate_repeats: bool,
+    ctx: &RequestContext,
 ) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>, ProxyError>
 where
     S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
+    let truncate_repeats = is_zte_codex_provider(ctx);
+    let session_id = &ctx.session_id;
     let mut stream = Box::pin(stream);
     let mut buffered: Vec<Bytes> = Vec::new();
     let mut sample_bytes = 0usize;
@@ -1449,6 +1511,10 @@ where
 
     if loop_detected {
         if truncate_repeats {
+            if let Err(e) = record_repeat_reply(ctx, &sample_text, sample_bytes) {
+                log::warn!("[Codex] 记录重复回复日志失败: {e}");
+            }
+            safe_blocks.push(Bytes::from(make_repeat_hint_delta(REPEAT_REPLY_HINT)));
             log::warn!(
                 "[Codex] zte 上游检测到重复循环，截断重复尾部并正常结束流 (采样 {} bytes, {} chars)",
                 sample_bytes,
@@ -1516,13 +1582,8 @@ async fn handle_codex_chat_to_responses_transform(
     }
 
     if is_stream || response.is_sse() {
-        let stream = codex_chat_preflight_repeat_detection(
-            response.bytes_stream(),
-            state,
-            &ctx.session_id,
-            is_zte_codex_provider(ctx),
-        )
-        .await?;
+        let stream =
+            codex_chat_preflight_repeat_detection(response.bytes_stream(), state, ctx).await?;
         let sse_stream = create_responses_sse_stream_from_chat_with_context(stream, tool_context);
         let sse_stream = record_responses_sse_stream(sse_stream, state.codex_chat_history.clone());
 
@@ -3036,7 +3097,7 @@ async fn log_usage(
 mod tests {
     use super::{
         body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, responses_sse_stream_to_anthropic_message,
+        codex_proxy_error_json, make_repeat_hint_delta, responses_sse_stream_to_anthropic_message,
         responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
         upstream_body_parse_error,
     };
@@ -3046,6 +3107,22 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[test]
+    fn repeat_hint_delta_is_valid_chat_content_delta() {
+        let hint = "当前对话出现高频重复内容，请压缩后继续回复";
+        let block = make_repeat_hint_delta(hint);
+        assert!(block.starts_with("data: "));
+        assert!(block.ends_with("\n\n"));
+
+        let data = block
+            .strip_prefix("data: ")
+            .and_then(|s| s.strip_suffix("\n\n"))
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(data).unwrap();
+        let content = value["choices"][0]["delta"]["content"].as_str().unwrap();
+        assert_eq!(content, hint);
+    }
 
     #[test]
     fn body_looks_like_sse_detects_unlabeled_sse_prefixes() {
