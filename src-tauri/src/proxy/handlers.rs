@@ -59,6 +59,11 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::pin::Pin;
 
+/// Codex 流式响应处理常用的「字节流」类型别名。
+///
+/// 避免普通函数返回复杂 `Pin<Box<dyn Stream...>>` 类型时触发 clippy::type-complexity。
+type CodexByteStream = Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>;
+
 // ============================================================================
 // 健康检查和状态查询（简单端点）
 // ============================================================================
@@ -1402,6 +1407,44 @@ fn make_repeat_hint_delta(hint: &str) -> String {
     )
 }
 
+/// 构造追加到 AI 回复末尾的压缩提示：基础提示 + 重复内容日志文件的完整路径，
+/// 便于用户在界面上看到提示后直接去对应文件核对 AI 的重复无效回复，判断是否误报。
+fn build_repeat_hint_with_path(log_path: &std::path::Path) -> String {
+    format!(
+        "{}。重复内容已记录到：{}",
+        REPEAT_REPLY_HINT,
+        log_path.display()
+    )
+}
+
+/// 构造 zte 命中重复循环后的截断响应：记录重复样本到日志、追加带全路径的压缩提示、
+/// 截断重复尾部并正常结束流（不再透传剩余重复内容）。
+///
+/// `loop_type` 用于日志区分「单条内重复(RepeatDetector)」与「跨 turn 车轱辘行动计划
+/// (CrossTurnDetector)」；两者对 zte 一视同仁：都记录 + 截断 + 提示。
+fn build_zte_repeat_truncated_stream(
+    ctx: &RequestContext,
+    sample_text: &str,
+    sample_bytes: usize,
+    safe_blocks: Vec<Bytes>,
+    loop_type: &str,
+) -> Result<CodexByteStream, ProxyError> {
+    let log_path = record_repeat_reply(ctx, sample_text, sample_bytes)
+        .map_err(|e| ProxyError::Internal(format!("记录重复回复日志失败: {e}")))?;
+    let hint = build_repeat_hint_with_path(&log_path);
+    let mut blocks = safe_blocks;
+    blocks.push(Bytes::from(make_repeat_hint_delta(&hint)));
+    log::warn!(
+        "[Codex] zte 上游检测到{loop_type}循环，截断重复尾部并正常结束流 (采样 {} bytes, {} chars)，日志: {}",
+        sample_bytes,
+        sample_text.chars().count(),
+        log_path.display()
+    );
+    Ok(Box::pin(futures::stream::iter(
+        blocks.into_iter().map(Ok::<Bytes, std::io::Error>),
+    )))
+}
+
 /// 仅对实际连接到 zte 网关的 Codex provider 启用重复输出截断。
 fn is_zte_codex_provider(ctx: &RequestContext) -> bool {
     if ctx.app_type != AppType::Codex {
@@ -1457,7 +1500,7 @@ async fn codex_chat_preflight_repeat_detection<S>(
     stream: S,
     state: &ProxyState,
     ctx: &RequestContext,
-) -> Result<Pin<Box<dyn futures::Stream<Item = Result<Bytes, std::io::Error>> + Send>>, ProxyError>
+) -> Result<CodexByteStream, ProxyError>
 where
     S: futures::Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static,
 {
@@ -1511,18 +1554,13 @@ where
 
     if loop_detected {
         if truncate_repeats {
-            if let Err(e) = record_repeat_reply(ctx, &sample_text, sample_bytes) {
-                log::warn!("[Codex] 记录重复回复日志失败: {e}");
-            }
-            safe_blocks.push(Bytes::from(make_repeat_hint_delta(REPEAT_REPLY_HINT)));
-            log::warn!(
-                "[Codex] zte 上游检测到重复循环，截断重复尾部并正常结束流 (采样 {} bytes, {} chars)",
+            return build_zte_repeat_truncated_stream(
+                ctx,
+                &sample_text,
                 sample_bytes,
-                sample_text_chars
+                safe_blocks,
+                "单条内重复(RepeatDetector)",
             );
-            return Ok(Box::pin(futures::stream::iter(
-                safe_blocks.into_iter().map(Ok::<Bytes, std::io::Error>),
-            )));
         }
         log::warn!(
             "[Codex] 检测到上游模型输出重复循环，中止并让客户端重试 (采样 {} bytes, {} chars)",
@@ -1545,7 +1583,19 @@ where
                 .write()
                 .map_err(|e| ProxyError::Internal(format!("cross_turn lock poisoned: {e}")))?
                 .check_and_record(session_id, &fingerprints);
-            if cross_hit && !truncate_repeats {
+            if cross_hit {
+                if truncate_repeats {
+                    log::warn!(
+                        "[Codex] 检测到跨 turn 车轱辘行动计划循环，截断并提示 (session={session_id}, 指纹={fingerprints:?})"
+                    );
+                    return build_zte_repeat_truncated_stream(
+                        ctx,
+                        &sample_text,
+                        sample_bytes,
+                        safe_blocks,
+                        "跨 turn 车轱辘行动计划(CrossTurnDetector)",
+                    );
+                }
                 log::warn!(
                     "[Codex] 检测到跨 turn 车轱辘行动计划循环，中止并让客户端重试 (session={session_id}, 指纹={fingerprints:?})"
                 );
@@ -3096,10 +3146,10 @@ async fn log_usage(
 #[cfg(test)]
 mod tests {
     use super::{
-        body_looks_like_sse, chat_sse_to_response_value, classify_body_for_diagnostics,
-        codex_proxy_error_json, make_repeat_hint_delta, responses_sse_stream_to_anthropic_message,
-        responses_sse_to_response_value, should_use_claude_transform_streaming, transform,
-        upstream_body_parse_error,
+        body_looks_like_sse, build_repeat_hint_with_path, chat_sse_to_response_value,
+        classify_body_for_diagnostics, codex_proxy_error_json, make_repeat_hint_delta,
+        responses_sse_stream_to_anthropic_message, responses_sse_to_response_value,
+        should_use_claude_transform_streaming, transform, upstream_body_parse_error,
     };
     use crate::proxy::ProxyError;
     use bytes::Bytes;
@@ -3122,6 +3172,17 @@ mod tests {
         let value: serde_json::Value = serde_json::from_str(data).unwrap();
         let content = value["choices"][0]["delta"]["content"].as_str().unwrap();
         assert_eq!(content, hint);
+    }
+
+    #[test]
+    fn repeat_hint_includes_log_file_absolute_path() {
+        let hint = build_repeat_hint_with_path(std::path::Path::new(
+            "D:\\Programs\\cc-switch-repeats\\repeat-reply-20260928-1030.txt",
+        ));
+        assert!(hint.contains("当前对话出现高频重复内容，请压缩后继续回复"));
+        assert!(hint.contains("重复内容已记录到："));
+        assert!(hint.contains("cc-switch-repeats"));
+        assert!(hint.contains("repeat-reply-20260928-1030.txt"));
     }
 
     #[test]
