@@ -1280,9 +1280,10 @@ impl RequestForwarder {
             // 区分两种原地重试的日志：429 与首包超时使用各自的延时和次数上限，
             // 便于在 cc-switch.log 里直接判断当前是在吸收限流还是在吸收上游首包卡顿。
             let (reason, attempts_budget) = match &result {
-                Err(error) if Self::is_first_byte_timeout(error) => {
-                    ("first-byte timeout (流式响应首包超时)", FIRST_BYTE_RETRY_ATTEMPTS)
-                }
+                Err(error) if Self::is_first_byte_timeout(error) => (
+                    "first-byte timeout (流式响应首包超时)",
+                    FIRST_BYTE_RETRY_ATTEMPTS,
+                ),
                 Err(_) => ("HTTP 429", RATE_LIMIT_RETRY_ATTEMPTS),
                 Ok(_) => unreachable!("retry wait only returned on an error"),
             };
