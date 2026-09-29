@@ -257,7 +257,7 @@ impl Database {
                     enabled: false,
                     auto_failover_enabled: false,
                     max_retries: 3,
-                    streaming_first_byte_timeout: 60,
+                    streaming_first_byte_timeout: 45,
                     streaming_idle_timeout: 120,
                     non_streaming_timeout: 600,
                     circuit_failure_threshold: 4,
@@ -435,7 +435,7 @@ impl Database {
                         request_timeout: 600, // 废弃字段，返回默认值
                         enable_logging: row.get::<_, i32>(3)? != 0,
                         live_takeover_active: false, // 废弃字段
-                        streaming_first_byte_timeout: row.get::<_, i32>(4).unwrap_or(60) as u64,
+                        streaming_first_byte_timeout: row.get::<_, i32>(4).unwrap_or(45) as u64,
                         streaming_idle_timeout: row.get::<_, i32>(5).unwrap_or(120) as u64,
                         non_streaming_timeout: row.get::<_, i32>(6).unwrap_or(600) as u64,
                     })

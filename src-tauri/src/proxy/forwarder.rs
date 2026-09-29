@@ -48,6 +48,13 @@ const PROXY_AUTH_PLACEHOLDER: &str = "PROXY_MANAGED";
 /// crosses a window boundary.
 const RATE_LIMIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// 流式响应「首包超时」后，同一 provider 原地自动重试前等待的时长（秒）。
+///
+/// 首包超时意味着上游已经接收请求、但迟迟不回响应头，多数情况是上游临时排队/卡顿，
+/// 立即重试大概率能成功，因此这里用一个很短的固定延时（1 秒），避免像 429 那样等满
+/// 一分钟才重试，从而把「干等 600 秒 → 甩 504 给客户端」收敛为「45 秒判定 + 短等重试」。
+const FIRST_BYTE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// How many extra attempts the *same* provider gets after a 429, before the failure is
 /// handed back to the normal failover path.
 ///
@@ -58,6 +65,15 @@ const RATE_LIMIT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_se
 /// "exceeded retry limit, last status: 429", which also halts a running `/goal`
 /// (goal continuation stops on a usage limit since Codex 0.132.0).
 const RATE_LIMIT_RETRY_ATTEMPTS: usize = 3;
+
+/// 流式响应「首包超时」在同一 provider 上的原地自动重试次数上限。
+///
+/// 与 `RATE_LIMIT_RETRY_ATTEMPTS` 一样，它独立于 `AppProxyConfig::max_retries`（后者按
+/// provider 计数、用于故障转移）。即使 failover 关闭、只有一个 provider，首包超时也会在
+/// 这里被就地重试最多 `FIRST_BYTE_RETRY_ATTEMPTS` 次，全部失败后才把 504 交还给客户端。
+/// 3 次是「能吸收偶发上游卡顿、又不至于无限等待」的折中：每次判定 45 秒 + 短延时，
+/// 最坏情况约 (45s + 1s) * 4 次尝试 ≈ 3 分钟，避免像原来那样单次就干等 10 分钟。
+const FIRST_BYTE_RETRY_ATTEMPTS: usize = 3;
 
 fn codex_bearer_access_token(headers: &http::HeaderMap) -> Option<&str> {
     let authorization = headers
@@ -1184,34 +1200,54 @@ impl RequestForwarder {
         })
     }
 
+    /// 判断错误是否为「流式响应首包超时」。
+    ///
+    /// 首包超时由 `forward()` 在发出流式请求、等待上游响应头超时后构造，
+    /// 消息固定以 `流式响应首包超时` 开头（见下方发送路径）。这里用消息前缀判定，
+    /// 是为了把首包超时与「响应体读取超时」「Responses 流无输出」等其他 `Timeout`
+    /// 区分开——只有首包超时适合原地重试，其余超时仍走原有 failover 语义。
+    fn is_first_byte_timeout(error: &ProxyError) -> bool {
+        matches!(error, ProxyError::Timeout(msg) if msg.starts_with("流式响应首包超时"))
+    }
+
     /// In-place retry delay for a failed attempt, or `None` when the error must be surfaced.
     ///
-    /// Only HTTP 429 is retried in place. Every other error — including the other
-    /// `Retryable` classes such as 5xx and timeouts — keeps the original failover
-    /// behaviour untouched, and once the per-provider budget
-    /// (`RATE_LIMIT_RETRY_ATTEMPTS`) is used up the 429 falls through to the normal
-    /// classification path so multi-provider setups can still switch provider.
+    /// HTTP 429 和「流式响应首包超时」会在同一 provider 上原地重试：
+    /// - 429：上游限流，等待 `RATE_LIMIT_RETRY_DELAY`（60s）后重试，越过限流窗口。
+    /// - 首包超时：上游临时排队/卡顿，短等 `FIRST_BYTE_RETRY_DELAY`（1s）后重试。
+    ///
+    /// 除这两种之外的错误（包括其余 5xx 和其他 `Retryable` 超时）保持原有 failover
+    /// 语义不变。各自的预算用尽后，429/首包超时都会回落到正常分类路径，从而在
+    /// 多 provider 场景下仍可切换供应商。
     fn rate_limit_retry_wait(
         &self,
         error: &ProxyError,
         retries_done: usize,
     ) -> Option<std::time::Duration> {
         let is_rate_limited = matches!(error, ProxyError::UpstreamError { status: 429, .. });
-        (is_rate_limited && retries_done < RATE_LIMIT_RETRY_ATTEMPTS)
-            .then_some(self.rate_limit_retry_delay)
+        let is_first_byte = Self::is_first_byte_timeout(error);
+
+        // 429 用独立的延时与次数预算；首包超时用另一组延时与次数预算。
+        if is_rate_limited && retries_done < RATE_LIMIT_RETRY_ATTEMPTS {
+            return Some(self.rate_limit_retry_delay);
+        }
+        if is_first_byte && retries_done < FIRST_BYTE_RETRY_ATTEMPTS {
+            return Some(FIRST_BYTE_RETRY_DELAY);
+        }
+        None
     }
 
-    /// Forward to one provider, waiting and retrying that same provider while it answers 429.
+    /// Forward to one provider, waiting and retrying that same provider on transient failures.
     ///
-    /// Motivation: `forward_with_retry_inner` classifies a 429 as `Retryable`, but "retryable"
-    /// there only means "try the next provider" — with no sleep at all and, in a
-    /// single-provider setup, no next provider to switch to. The 429 therefore reaches Codex
-    /// verbatim. Sleeping here absorbs the rate limit *below* Codex, so Codex never sees a
-    /// usage limit and a running `/goal` keeps auto-continuing instead of stalling.
+    /// 支持两种「同一 provider 原地重试」的场景：
+    /// - HTTP 429：上游限流，等待 `RATE_LIMIT_RETRY_DELAY` 后重试，让 Codex 永远看不到限流。
+    /// - 流式响应首包超时：上游迟迟不回响应头，短等 `FIRST_BYTE_RETRY_DELAY` 后重试，
+    ///   把「干等 600 秒 → 甩 504」收敛为「短超时判定 + 快速重试」。
     ///
-    /// Safety: this wraps `forward()`, which returns either a complete `ProxyResponse` or an
-    /// error. Nothing has been written to the client at this point, so sleeping and re-issuing
-    /// cannot corrupt an in-flight SSE stream.
+    /// 其余错误（5xx、其他超时等）保持原有 failover 语义，交给 `forward_with_retry_inner`
+    /// 尝试下一个 provider。函数包装 `forward()`，它要么返回完整 `ProxyResponse`、要么返回
+    /// 错误；在 `forward()` 返回前客户端尚未收到任何数据，因此这里睡眠并重发不会破坏
+    /// 正在进行的 SSE 流。
     #[allow(clippy::too_many_arguments)]
     async fn forward_with_rate_limit_retry(
         &self,
@@ -1241,13 +1277,22 @@ impl RequestForwarder {
             };
 
             retries_done += 1;
+            // 区分两种原地重试的日志：429 与首包超时使用各自的延时和次数上限，
+            // 便于在 cc-switch.log 里直接判断当前是在吸收限流还是在吸收上游首包卡顿。
+            let (reason, attempts_budget) = match &result {
+                Err(error) if Self::is_first_byte_timeout(error) => {
+                    ("first-byte timeout (流式响应首包超时)", FIRST_BYTE_RETRY_ATTEMPTS)
+                }
+                Err(_) => ("HTTP 429", RATE_LIMIT_RETRY_ATTEMPTS),
+                Ok(_) => unreachable!("retry wait only returned on an error"),
+            };
             log::warn!(
-                "[{}] Upstream rate limited (HTTP 429) on provider={}, waiting {}s before in-place retry {}/{}",
+                "[{}] Upstream transient failure ({reason}) on provider={}, waiting {}s before in-place retry {}/{}",
                 app_type.as_str(),
                 provider.id,
                 wait.as_secs(),
                 retries_done,
-                RATE_LIMIT_RETRY_ATTEMPTS
+                attempts_budget
             );
             tokio::time::sleep(wait).await;
         }

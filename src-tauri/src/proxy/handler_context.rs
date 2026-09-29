@@ -199,22 +199,22 @@ impl RequestContext {
     /// - 故障转移开启：超时配置正常生效（0 表示禁用超时）
     /// - 故障转移关闭：超时配置不生效（全部传入 0）
     pub fn create_forwarder(&self, state: &ProxyState) -> RequestForwarder {
-        let (non_streaming_timeout, first_byte_timeout, idle_timeout) =
-            if self.app_config.auto_failover_enabled {
-                // 故障转移开启：使用配置的值（0 = 禁用超时）
-                (
-                    self.app_config.non_streaming_timeout as u64,
-                    self.app_config.streaming_first_byte_timeout as u64,
-                    self.app_config.streaming_idle_timeout as u64,
-                )
-            } else {
-                // 故障转移关闭：不启用超时配置
-                log::debug!(
-                    "[{}] Failover disabled, timeout configs are bypassed",
-                    self.tag
-                );
-                (0, 0, 0)
-            };
+        // 首包超时始终按配置生效：流式请求等待上游响应头，超过 `streaming_first_byte_timeout`
+        // 即判定为「流式响应首包超时」，随后在 forwarder 内对同一 provider 原地自动重试。
+        // 该值即使 failover 关闭也必须透传，否则会被置 0 并兜底回硬编码的 600 秒，
+        // 导致首包超时既不能按 45 秒生效、也无法触发原地重试。
+        let first_byte_timeout = self.app_config.streaming_first_byte_timeout as u64;
+
+        // 非流式总超时与流式静默超时仍遵循「failover 关闭即禁用」的既有语义：
+        // 关闭 failover 时归 0，表示「不设总时长上限、不按静默间隔掐断」，避免行为突变。
+        let (non_streaming_timeout, idle_timeout) = if self.app_config.auto_failover_enabled {
+            (
+                self.app_config.non_streaming_timeout as u64,
+                self.app_config.streaming_idle_timeout as u64,
+            )
+        } else {
+            (0, 0)
+        };
 
         // 故障转移关闭时强制 max_retries=0（仅尝试 1 个 provider），与「不超时 + 不切换」语义一致。
         let max_retries = if self.app_config.auto_failover_enabled {

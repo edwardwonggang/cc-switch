@@ -16,7 +16,7 @@ pub struct ProxyConfig {
     /// 是否正在接管 Live 配置
     #[serde(default)]
     pub live_takeover_active: bool,
-    /// 流式首字超时（秒）- 等待首个数据块的最大时间，范围 1-120 秒，默认 60 秒
+    /// 流式首字超时（秒）- 等待首个数据块的最大时间，范围 1-120 秒，默认 45 秒
     #[serde(default = "default_streaming_first_byte_timeout")]
     pub streaming_first_byte_timeout: u64,
     /// 流式静默超时（秒）- 两个数据块之间的最大间隔，范围 60-600 秒，填 0 禁用（防止中途卡住）
@@ -28,7 +28,7 @@ pub struct ProxyConfig {
 }
 
 fn default_streaming_first_byte_timeout() -> u64 {
-    60
+    45
 }
 
 fn default_streaming_idle_timeout() -> u64 {
@@ -48,7 +48,7 @@ impl Default for ProxyConfig {
             request_timeout: 600,
             enable_logging: true,
             live_takeover_active: false,
-            streaming_first_byte_timeout: 60,
+            streaming_first_byte_timeout: 45,
             streaming_idle_timeout: 120,
             non_streaming_timeout: 600,
         }

@@ -25,7 +25,7 @@ export function AutoFailoverConfigPanel({
   const [formData, setFormData] = useState({
     autoFailoverEnabled: false,
     maxRetries: "3",
-    streamingFirstByteTimeout: "60",
+    streamingFirstByteTimeout: "45",
     streamingIdleTimeout: "120",
     nonStreamingTimeout: "600",
     circuitFailureThreshold: "5",
