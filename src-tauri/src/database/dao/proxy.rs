@@ -326,10 +326,10 @@ impl Database {
         let (retries, fb_timeout, idle_timeout, cb_fail, cb_succ, cb_timeout, cb_rate, cb_min) =
             match app_type {
                 "claude" => (6, 90, 180, 8, 3, 90, 0.7, 15),
-                "codex" => (3, 60, 120, 4, 2, 60, 0.6, 10),
-                "gemini" => (5, 60, 120, 4, 2, 60, 0.6, 10),
-                "grokbuild" => (3, 60, 120, 4, 2, 60, 0.6, 10),
-                _ => (3, 60, 120, 4, 2, 60, 0.6, 10), // 默认值
+                "codex" => (3, 45, 120, 4, 2, 60, 0.6, 10),
+                "gemini" => (5, 45, 120, 4, 2, 60, 0.6, 10),
+                "grokbuild" => (3, 45, 120, 4, 2, 60, 0.6, 10),
+                _ => (3, 45, 120, 4, 2, 60, 0.6, 10), // 默认值
             };
 
         conn.execute(
