@@ -4197,7 +4197,10 @@ mod tests {
         for _ in 0..50 {
             let wait = forwarder.effective_429_retry_delay(base);
             assert!(wait >= base, "wait should not shrink below the base delay");
-            assert!(wait <= base + jitter, "wait should not exceed base + jitter");
+            assert!(
+                wait <= base + jitter,
+                "wait should not exceed base + jitter"
+            );
         }
     }
 
