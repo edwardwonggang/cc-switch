@@ -64,7 +64,19 @@ const FIRST_BYTE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_se
 /// exhausts its own `request_max_retries` (default 4, ~15s of backoff) and prints
 /// "exceeded retry limit, last status: 429", which also halts a running `/goal`
 /// (goal continuation stops on a usage limit since Codex 0.132.0).
-const RATE_LIMIT_RETRY_ATTEMPTS: usize = 3;
+///
+/// 6 次是针对「多 Codex 对话并发限流」场景调高的余量：每个 429 最多等 6 轮
+/// `RATE_LIMIT_RETRY_DELAY`（每次 60s+抖动）再重试，给持续打满 QPM/TPM 的并发高峰
+/// 更多跨过分钟窗口的机会，从而把 429 尽量留在 cc-switch 内而不是回传给客户端。
+const RATE_LIMIT_RETRY_ATTEMPTS: usize = 6;
+
+/// 429 原地重试时叠加在基础延时之上的随机抖动上限。
+///
+/// 多个并发请求若都在固定 60s 后同时重试，重试瞬间仍可能一起打满上游按分钟统计的
+/// QPM/TPM 配额（这正是多 Codex 对话并发限流时 429 反复出现的根因）。给每个请求加
+/// `0..=JITTER` 秒的随机延时，把它们在分钟窗口后的重试时刻错开，降低"同步撞车"
+/// 概率。基础 `RATE_LIMIT_RETRY_DELAY` 保留，保证等待不会短于能跨过分钟窗口的最小值。
+const RATE_LIMIT_RETRY_JITTER: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// 流式响应「首包超时」在同一 provider 上的原地自动重试次数上限。
 ///
@@ -230,6 +242,11 @@ pub struct RequestForwarder {
     /// unit tests can drive the retry loop with a zero delay; production always uses the
     /// constant (see `RequestForwarder::new`).
     rate_limit_retry_delay: std::time::Duration,
+    /// 429 原地重试时叠加在 `rate_limit_retry_delay` 之上的随机抖动上限。
+    ///
+    /// Exposed as a field so unit tests can set it to zero and neutralise the jitter along
+    /// with the base delay; production always uses `RATE_LIMIT_RETRY_JITTER` (see `new`).
+    rate_limit_retry_jitter: std::time::Duration,
 }
 
 impl RequestForwarder {
@@ -321,6 +338,7 @@ impl RequestForwarder {
             ),
             max_attempts,
             rate_limit_retry_delay: RATE_LIMIT_RETRY_DELAY,
+            rate_limit_retry_jitter: RATE_LIMIT_RETRY_JITTER,
         }
     }
 
@@ -1213,7 +1231,8 @@ impl RequestForwarder {
     /// In-place retry delay for a failed attempt, or `None` when the error must be surfaced.
     ///
     /// HTTP 429 和「流式响应首包超时」会在同一 provider 上原地重试：
-    /// - 429：上游限流，等待 `RATE_LIMIT_RETRY_DELAY`（60s）后重试，越过限流窗口。
+    /// - 429：上游限流，返回基础延时 `rate_limit_retry_delay`（60s）；随机抖动由调用方
+    ///   `forward_with_rate_limit_retry` 在 sleep 阶段叠加，本函数只负责判定与预算。
     /// - 首包超时：上游临时排队/卡顿，短等 `FIRST_BYTE_RETRY_DELAY`（1s）后重试。
     ///
     /// 除这两种之外的错误（包括其余 5xx 和其他 `Retryable` 超时）保持原有 failover
@@ -1240,7 +1259,8 @@ impl RequestForwarder {
     /// Forward to one provider, waiting and retrying that same provider on transient failures.
     ///
     /// 支持两种「同一 provider 原地重试」的场景：
-    /// - HTTP 429：上游限流，等待 `RATE_LIMIT_RETRY_DELAY` 后重试，让 Codex 永远看不到限流。
+    /// - HTTP 429：上游限流，等待 `RATE_LIMIT_RETRY_DELAY` + 随机抖动后重试，让 Codex
+    ///   永远看不到限流，并用抖动错开多个并发请求的重试时刻。
     /// - 流式响应首包超时：上游迟迟不回响应头，短等 `FIRST_BYTE_RETRY_DELAY` 后重试，
     ///   把「干等 600 秒 → 甩 504」收敛为「短超时判定 + 快速重试」。
     ///
@@ -1268,24 +1288,32 @@ impl RequestForwarder {
                 )
                 .await;
 
-            let wait = match &result {
+            let base_wait = match &result {
                 Err(error) => self.rate_limit_retry_wait(error, retries_done),
                 Ok(_) => None,
             };
-            let Some(wait) = wait else {
+            let Some(base_wait) = base_wait else {
                 return result;
             };
 
             retries_done += 1;
             // 区分两种原地重试的日志：429 与首包超时使用各自的延时和次数上限，
             // 便于在 cc-switch.log 里直接判断当前是在吸收限流还是在吸收上游首包卡顿。
-            let (reason, attempts_budget) = match &result {
+            let (reason, attempts_budget, is_rate_limited) = match &result {
                 Err(error) if Self::is_first_byte_timeout(error) => (
                     "first-byte timeout (流式响应首包超时)",
                     FIRST_BYTE_RETRY_ATTEMPTS,
+                    false,
                 ),
-                Err(_) => ("HTTP 429", RATE_LIMIT_RETRY_ATTEMPTS),
+                Err(_) => ("HTTP 429", RATE_LIMIT_RETRY_ATTEMPTS, true),
                 Ok(_) => unreachable!("retry wait only returned on an error"),
+            };
+            // 仅 429 叠加随机抖动，错开多个并发请求的重试时刻；首包超时的 1s 短延时
+            // 保持原样，保证快速重试语义。
+            let wait = if is_rate_limited {
+                self.effective_429_retry_delay(base_wait)
+            } else {
+                base_wait
             };
             log::warn!(
                 "[{}] Upstream transient failure ({reason}) on provider={}, waiting {}s before in-place retry {}/{}",
@@ -1297,6 +1325,22 @@ impl RequestForwarder {
             );
             tokio::time::sleep(wait).await;
         }
+    }
+
+    /// 计算 429 原地重试的实际等待时长：基础延时 + 随机抖动。
+    ///
+    /// 抖动源用标准库 `SystemTime` 纳秒取模，避免为一行随机数引入第三方依赖；
+    /// 当 `rate_limit_retry_jitter` 为零（测试注入）时直接返回基础延时。
+    fn effective_429_retry_delay(&self, base: std::time::Duration) -> std::time::Duration {
+        let jitter_secs = self.rate_limit_retry_jitter.as_secs();
+        if jitter_secs == 0 {
+            return base;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        base + std::time::Duration::from_secs((nanos % (jitter_secs as u128)) as u64)
     }
 
     /// 转发单个请求（使用适配器）
@@ -4081,6 +4125,7 @@ mod tests {
             streaming_first_byte_timeout,
             max_attempts: 1,
             rate_limit_retry_delay: RATE_LIMIT_RETRY_DELAY,
+            rate_limit_retry_jitter: Duration::ZERO,
         }
     }
 
@@ -4133,6 +4178,27 @@ mod tests {
             forwarder.rate_limit_retry_wait(&rate_limited, 0),
             Some(Duration::ZERO)
         );
+    }
+
+    #[test]
+    fn rate_limit_jitter_stays_within_budget_and_is_neutralisable() {
+        let mut forwarder = test_forwarder(Duration::ZERO, Duration::ZERO);
+
+        // 抖动为零（测试默认）时直接返回基础延时，保证确定性。
+        assert_eq!(
+            forwarder.effective_429_retry_delay(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+
+        // 抖动非零时，结果始终落在 [base, base + jitter] 区间内。
+        let jitter = Duration::from_secs(20);
+        let base = Duration::from_secs(60);
+        forwarder.rate_limit_retry_jitter = jitter;
+        for _ in 0..50 {
+            let wait = forwarder.effective_429_retry_delay(base);
+            assert!(wait >= base, "wait should not shrink below the base delay");
+            assert!(wait <= base + jitter, "wait should not exceed base + jitter");
+        }
     }
 
     #[test]
