@@ -33,6 +33,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http::Extensions;
 use serde_json::Value;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tauri::Manager;
 use tokio::sync::RwLock;
@@ -77,6 +78,12 @@ const RATE_LIMIT_RETRY_ATTEMPTS: usize = 6;
 /// `0..=JITTER` 秒的随机延时，把它们在分钟窗口后的重试时刻错开，降低"同步撞车"
 /// 概率。基础 `RATE_LIMIT_RETRY_DELAY` 保留，保证等待不会短于能跨过分钟窗口的最小值。
 const RATE_LIMIT_RETRY_JITTER: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// 429 抖动用的进程级自增序号。
+///
+/// `effective_429_retry_delay` 用它和墙钟纳秒混合，保证并发请求各自拿到不同的抖动，
+/// 避免它们在同一毫秒内计算出相同的重试时刻。
+static JITTER_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// 流式响应「首包超时」在同一 provider 上的原地自动重试次数上限。
 ///
@@ -1293,6 +1300,23 @@ impl RequestForwarder {
                 Ok(_) => None,
             };
             let Some(base_wait) = base_wait else {
+                // 原地重试预算耗尽：429 / 首包超时都要回落到正常错误路径。429 在这里
+                // 会原样泄漏给客户端（Codex），必须打一条明确的日志，便于在 cc-switch.log
+                // 里区分「正在吸收限流」和「重试耗尽后最终泄漏」。
+                if let Err(error) = &result {
+                    let is_rate_limited =
+                        matches!(error, ProxyError::UpstreamError { status: 429, .. });
+                    if is_rate_limited {
+                        log::error!(
+                            "[{}] HTTP 429 on provider={} exhausted in-place retry budget ({}/{}), surfacing 429 to client after {} attempts",
+                            app_type.as_str(),
+                            provider.id,
+                            retries_done,
+                            RATE_LIMIT_RETRY_ATTEMPTS,
+                            retries_done + 1
+                        );
+                    }
+                }
                 return result;
             };
 
@@ -1329,7 +1353,10 @@ impl RequestForwarder {
 
     /// 计算 429 原地重试的实际等待时长：基础延时 + 随机抖动。
     ///
-    /// 抖动源用标准库 `SystemTime` 纳秒取模，避免为一行随机数引入第三方依赖；
+    /// 抖动源必须让**每个并发请求**得到不同值，才能真正错开重试时刻。若只按
+    /// `SystemTime` 纳秒取模，多个并发请求会在几乎同一时刻调用本函数、拿到几乎
+    /// 相同的纳秒值，从而算出相同的抖动并再次同步撞车。因此这里用进程级自增序号
+    /// 与墙钟纳秒做异或混淆，保证同一毫秒内并发的每次调用结果互不相同。
     /// 当 `rate_limit_retry_jitter` 为零（测试注入）时直接返回基础延时。
     fn effective_429_retry_delay(&self, base: std::time::Duration) -> std::time::Duration {
         let jitter_secs = self.rate_limit_retry_jitter.as_secs();
@@ -1340,7 +1367,15 @@ impl RequestForwarder {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        base + std::time::Duration::from_secs((nanos % (jitter_secs as u128)) as u64)
+        // 每次调用自增的序号：并发请求的调用次序不同，混合后结果不同。
+        let seq = JITTER_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        // 墙钟纳秒 + 序号经 xorshift 散列混淆，得到 0..=jitter_secs 的伪随机秒数。
+        let mut x = (nanos as u64) ^ seq.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        let h = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        base + std::time::Duration::from_secs((h % (jitter_secs as u64)) as u64)
     }
 
     /// 转发单个请求（使用适配器）
@@ -4194,6 +4229,7 @@ mod tests {
         let jitter = Duration::from_secs(20);
         let base = Duration::from_secs(60);
         forwarder.rate_limit_retry_jitter = jitter;
+        let mut seen_delays = std::collections::HashSet::new();
         for _ in 0..50 {
             let wait = forwarder.effective_429_retry_delay(base);
             assert!(wait >= base, "wait should not shrink below the base delay");
@@ -4201,7 +4237,14 @@ mod tests {
                 wait <= base + jitter,
                 "wait should not exceed base + jitter"
             );
+            seen_delays.insert(wait);
         }
+        // 并发/连续调用必须能产生不同的抖动，否则多个请求会算出相同等待并再次同步撞车。
+        assert!(
+            seen_delays.len() > 1,
+            "jitter must vary across calls to stagger concurrent retries, got {} distinct delays",
+            seen_delays.len()
+        );
     }
 
     #[test]
