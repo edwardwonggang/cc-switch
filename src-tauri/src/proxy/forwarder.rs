@@ -1375,7 +1375,7 @@ impl RequestForwarder {
         x ^= x << 25;
         x ^= x >> 27;
         let h = x.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        base + std::time::Duration::from_secs((h % (jitter_secs as u64)) as u64)
+        base + std::time::Duration::from_secs(h % jitter_secs)
     }
 
     /// 转发单个请求（使用适配器）
