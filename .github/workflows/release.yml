@@ -243,7 +243,10 @@ jobs:
           # while skipping WiX/NSIS downloads and installer packaging.
           if ($env:BUILD_INSTALLERS -eq 'true') {
             pnpm tauri build --bundles "msi,nsis" --config src-tauri/tauri.unsigned.conf.json
+            if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
           } elseif ($env:PORTABLE_CACHE_HIT -eq 'true') {
+            # Restore is pure PowerShell/.NET and validates by throwing.
+            # LASTEXITCODE is unset in this fresh step when no native tool ran.
             ./.github/scripts/windows-portable-cache.ps1 -Action Restore
           } else {
             $tauriBuildArguments = @($env:TAURI_PORTABLE_ARGS_JSON | ConvertFrom-Json)
@@ -251,7 +254,6 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
             ./.github/scripts/windows-portable-cache.ps1 -Action Capture
           }
-          if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
 
       - name: Prepare Windows assets
         shell: pwsh
