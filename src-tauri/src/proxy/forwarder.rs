@@ -225,6 +225,7 @@ pub struct RequestForwarder {
     current_provider_id_at_start: String,
     /// A model-scoped route is independent of the device's selected default.
     model_routed: bool,
+    upstream_model: Option<String>,
     /// 代理会话 ID（用于 Gemini Native shadow replay）
     session_id: String,
     /// Session ID 是否由客户端提供；生成值不能作为上游缓存身份。
@@ -337,6 +338,7 @@ impl RequestForwarder {
             app_handle,
             current_provider_id_at_start,
             model_routed: false,
+            upstream_model: None,
             session_id,
             session_client_provided,
             rectifier_config,
@@ -354,6 +356,11 @@ impl RequestForwarder {
 
     pub fn with_model_routing(mut self, model_routed: bool) -> Self {
         self.model_routed = model_routed;
+        self
+    }
+
+    pub fn with_upstream_model(mut self, model: Option<String>) -> Self {
+        self.upstream_model = model;
         self
     }
 
@@ -590,6 +597,10 @@ impl RequestForwarder {
                 } else {
                     body.clone()
                 };
+
+            if let Some(model) = self.upstream_model.as_ref() {
+                provider_body["model"] = serde_json::json!(model);
+            }
 
             attempted_providers += 1;
 
@@ -4158,6 +4169,7 @@ mod tests {
             app_handle: None,
             current_provider_id_at_start: String::new(),
             model_routed: false,
+            upstream_model: None,
             session_id: String::new(),
             session_client_provided: false,
             rectifier_config: RectifierConfig::default(),

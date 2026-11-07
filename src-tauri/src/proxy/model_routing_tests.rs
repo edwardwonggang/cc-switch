@@ -45,9 +45,201 @@ impl Drop for TestHome {
     }
 }
 
+#[test]
+#[serial_test::serial]
+fn unified_builtin_is_always_listed_without_persisting_or_selecting_it() {
+    let _home = TestHome::new();
+    let db = Arc::new(Database::memory().unwrap());
+    let state = crate::store::AppState::new(db.clone());
+    for _ in 0..2 {
+        let listed =
+            crate::services::ProviderService::list(&state, crate::app_config::AppType::Codex)
+                .unwrap();
+        assert_eq!(
+            listed.first().unwrap().0,
+            model_routing::UNIFIED_PROVIDER_ID
+        );
+        assert_eq!(listed[model_routing::UNIFIED_PROVIDER_ID].name, "Codex");
+        assert!(db.get_all_providers("codex").unwrap().is_empty());
+        assert!(db.get_current_provider("codex").unwrap().is_none());
+    }
+    assert!(
+        crate::services::ProviderService::list(&state, crate::app_config::AppType::Claude,)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 #[serial_test::serial]
-async fn model_routing_http_isolates_models_credentials_failover_and_default() {
+async fn unified_member_save_is_db_only_until_selected_and_rejects_empty_active_card() {
+    let _home = TestHome::new();
+    let db = Arc::new(Database::memory().unwrap());
+    let state = crate::store::AppState::new(db.clone());
+    let config_path = crate::codex_config::get_codex_config_path();
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    std::fs::write(&config_path, "model = \"unchanged-user-choice\"\n").unwrap();
+    let original_config = std::fs::read(&config_path).unwrap();
+    let member = Provider::with_id(
+        "a".to_string(),
+        "A".to_string(),
+        json!({"auth": {}, "config": "model = \"real-model\"\n",
+               "modelCatalog": {"models": [{"model": "real-model"}]}}),
+        None,
+    );
+    db.save_provider("codex", &member).unwrap();
+    let unified = state
+        .proxy_service
+        .save_codex_unified_members(vec!["a".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(model_routing::member_ids(&unified).unwrap(), ["a"]);
+    assert!(db.get_current_provider("codex").unwrap().is_none());
+    assert_eq!(std::fs::read(&config_path).unwrap(), original_config);
+    assert_eq!(
+        db.get_provider_by_id("a", "codex")
+            .unwrap()
+            .unwrap()
+            .settings_config,
+        member.settings_config
+    );
+    assert!(db.get_live_backup("codex").await.unwrap().is_none());
+    assert!(!state.proxy_service.is_running().await);
+
+    db.set_current_provider("codex", &unified.id).unwrap();
+    crate::settings::set_current_provider(&crate::app_config::AppType::Codex, Some(&unified.id))
+        .unwrap();
+    assert!(state
+        .proxy_service
+        .save_codex_unified_members(Vec::new())
+        .await
+        .is_err());
+    assert_eq!(
+        model_routing::member_ids(
+            &db.get_provider_by_id(&unified.id, "codex")
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        ["a"]
+    );
+    assert_eq!(
+        db.get_current_provider("codex").unwrap().as_deref(),
+        Some(unified.id.as_str())
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), original_config);
+    assert!(crate::services::ProviderService::delete(
+        &state,
+        crate::app_config::AppType::Codex,
+        "a"
+    )
+    .is_err());
+    assert!(crate::services::ProviderService::delete(
+        &state,
+        crate::app_config::AppType::Codex,
+        &unified.id
+    )
+    .is_err());
+    assert!(db.get_provider_by_id("a", "codex").unwrap().is_some());
+
+    // An invalid ordinary-provider edit must fail before changing its name,
+    // credential source or the unified membership.
+    let mut invalid = member.clone();
+    invalid.name = "B".to_string();
+    invalid.settings_config["auth"] = json!("invalid-auth-shape");
+    assert!(crate::services::ProviderService::update(
+        &state,
+        crate::app_config::AppType::Codex,
+        None,
+        invalid,
+    )
+    .is_err());
+    assert_eq!(
+        db.get_provider_by_id("a", "codex").unwrap().unwrap().name,
+        "A"
+    );
+    db.conn
+        .lock()
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER reject_unified_backup BEFORE INSERT ON proxy_live_backup
+         BEGIN SELECT RAISE(ABORT, 'fake backup blocked'); END;",
+        )
+        .unwrap();
+    let mut renamed = member.clone();
+    renamed.name = "Renamed A".to_string();
+    assert!(crate::services::ProviderService::update(
+        &state,
+        crate::app_config::AppType::Codex,
+        None,
+        renamed,
+    )
+    .is_err());
+    assert_eq!(
+        db.get_provider_by_id("a", "codex").unwrap().unwrap().name,
+        "A"
+    );
+    assert_eq!(std::fs::read(&config_path).unwrap(), original_config);
+    assert!(!crate::codex_config::get_codex_model_catalog_path().exists());
+    assert_eq!(
+        db.get_current_provider("codex").unwrap().as_deref(),
+        Some(unified.id.as_str())
+    );
+}
+
+#[test]
+#[serial_test::serial]
+fn unified_alias_map_handles_hyphens_renames_missing_and_recursive_members() {
+    let _home = TestHome::new();
+    let db = Database::memory().unwrap();
+    let a = Provider::with_id(
+        "a".to_string(),
+        "A-B".to_string(),
+        json!({
+            "modelCatalog": {"models": [{"model": "C"}]}
+        }),
+        None,
+    );
+    let b = Provider::with_id(
+        "b".to_string(),
+        "A".to_string(),
+        json!({
+            "modelCatalog": {"models": [{"model": "B-C"}]}
+        }),
+        None,
+    );
+    db.save_provider("codex", &a).unwrap();
+    db.save_provider("codex", &b).unwrap();
+    let mut unified = model_routing::builtin();
+    unified.settings_config["memberProviderIds"] = json!(["a", "b"]);
+    let routes = model_routing::routes(&db, &unified).unwrap();
+    assert_eq!(routes.len(), 2);
+    assert_ne!(routes[0].preview.alias, routes[1].preview.alias);
+    for expected in routes {
+        let resolved = model_routing::resolve(&db, &unified, &expected.preview.alias).unwrap();
+        assert_eq!(resolved.provider.id, expected.preview.provider_id);
+        assert_eq!(resolved.preview.actual_model, expected.preview.actual_model);
+    }
+    let old_alias = model_routing::routes(&db, &unified).unwrap()[0]
+        .preview
+        .alias
+        .clone();
+    let mut renamed = a.clone();
+    renamed.name = "公司 New".to_string();
+    db.save_provider("codex", &renamed).unwrap();
+    assert!(model_routing::resolve(&db, &unified, &old_alias).is_err());
+    let renamed_route = model_routing::resolve(&db, &unified, "公司-New-C").unwrap();
+    assert_eq!(renamed_route.provider.id, "a");
+    assert_eq!(renamed_route.preview.actual_model, "C");
+    db.delete_provider("codex", "a").unwrap();
+    assert!(model_routing::resolve(&db, &unified, "公司-New-C").is_err());
+    unified.settings_config["memberProviderIds"] = json!([model_routing::UNIFIED_PROVIDER_ID]);
+    assert!(model_routing::routes(&db, &unified).is_err());
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_back() {
     let _home = TestHome::new();
     let db = Arc::new(Database::memory().unwrap());
     let captured = Arc::new(Mutex::new(Vec::<(String, String, String)>::new()));
@@ -124,7 +316,11 @@ async fn model_routing_http_isolates_models_credentials_failover_and_default() {
     }
     db.set_current_provider("codex", "a").unwrap();
     crate::settings::set_current_provider(&crate::app_config::AppType::Codex, Some("a")).unwrap();
-    db.set_setting(model_routing::CODEX_MODEL_ROUTING_SETTING, "true")
+    let mut unified = model_routing::builtin();
+    unified.settings_config["memberProviderIds"] = json!(["a", "b"]);
+    db.save_provider("codex", &unified).unwrap();
+    db.set_current_provider("codex", &unified.id).unwrap();
+    crate::settings::set_current_provider(&crate::app_config::AppType::Codex, Some(&unified.id))
         .unwrap();
     let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
     config.auto_failover_enabled = true;
@@ -149,29 +345,47 @@ async fn model_routing_http_isolates_models_credentials_failover_and_default() {
             .header(header::AUTHORIZATION, "Bearer fake-client")
             .json(&json!({"model": model, "input": "hello", "stream": false}))
     };
-    let (a, b) = tokio::join!(request("Model-A").send(), request("Model-B").send());
+    let (a, b) = tokio::join!(request("a-Model-A").send(), request("b-Model-B").send());
     assert_eq!(a.unwrap().status(), StatusCode::OK);
     assert_eq!(b.unwrap().status(), StatusCode::OK);
     assert_eq!(
-        request("Shared").send().await.unwrap().status(),
+        request("a-Shared").send().await.unwrap().status(),
         StatusCode::OK
     );
     assert_eq!(captured.lock().await.last().unwrap().0, "a");
-    fail_first.store(true, Ordering::SeqCst);
     assert_eq!(
-        request("Shared").send().await.unwrap().status(),
+        request("b-Shared").send().await.unwrap().status(),
         StatusCode::OK
     );
     assert_eq!(captured.lock().await.last().unwrap().0, "b");
+    fail_first.store(true, Ordering::SeqCst);
+    let before_failure = captured.lock().await.len();
+    assert_eq!(
+        request("a-Shared").send().await.unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(captured.lock().await.len(), before_failure + 1);
+    assert_eq!(captured.lock().await.last().unwrap().0, "a");
+    let before_unknown = captured.lock().await.len();
     assert_eq!(
         request("unknown").send().await.unwrap().status(),
-        StatusCode::OK
+        StatusCode::BAD_REQUEST
     );
-    assert_eq!(captured.lock().await.last().unwrap().0, "a");
-    db.set_setting(model_routing::CODEX_MODEL_ROUTING_SETTING, "false")
-        .unwrap();
     assert_eq!(
-        request("Model-B").send().await.unwrap().status(),
+        request("Shared").send().await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(captured.lock().await.len(), before_unknown);
+    assert_eq!(
+        db.get_current_provider("codex").unwrap().as_deref(),
+        Some(unified.id.as_str())
+    );
+    // An ordinary provider explicitly selected by the user restores its exact
+    // legacy routing behavior; the unified card remains available in the DB.
+    db.set_current_provider("codex", "a").unwrap();
+    crate::settings::set_current_provider(&crate::app_config::AppType::Codex, Some("a")).unwrap();
+    assert_eq!(
+        request("Model-A").send().await.unwrap().status(),
         StatusCode::OK
     );
     assert_eq!(captured.lock().await.last().unwrap().0, "a");

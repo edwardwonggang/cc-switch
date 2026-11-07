@@ -96,10 +96,10 @@ pub async fn get_status(State(state): State<ProxyState>) -> Result<Json<ProxySta
 /// cc-switch–owned `model_catalog_json`, using the same path ownership rules as
 /// Codex live-setting import.
 pub async fn handle_models(State(state): State<ProxyState>) -> Result<Json<Value>, ProxyError> {
-    if super::model_routing::enabled(&state.db)
+    if let Some(unified) = super::model_routing::active(&state.db)
         .map_err(|error| ProxyError::DatabaseError(error.to_string()))?
     {
-        return super::model_routing::combined_catalog(&state.db)
+        return super::model_routing::catalog(&state.db, &unified)
             .map(Json)
             .map_err(|error| ProxyError::ConfigError(error.to_string()));
     }

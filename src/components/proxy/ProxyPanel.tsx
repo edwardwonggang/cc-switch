@@ -15,7 +15,6 @@ import { Switch } from "@/components/ui/switch";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { ToggleRow } from "@/components/ui/toggle-row";
-import { CodexModelRoutingToggle } from "./CodexModelRoutingToggle";
 import { toast } from "sonner";
 import { useFailoverQueue } from "@/lib/query/failover";
 import { ProviderHealthBadge } from "@/components/providers/ProviderHealthBadge";
@@ -312,8 +311,6 @@ export function ProxyPanel({
             </motion.div>
           )}
         </AnimatePresence>
-
-        <CodexModelRoutingToggle takenOver={takeoverStatus?.codex ?? false} />
 
         {/* Running state: service info + stats */}
         {isRunning && status ? (

@@ -67,14 +67,6 @@ export const proxyApi = {
     return invoke("update_proxy_config_for_app", { config });
   },
 
-  async getCodexModelRoutingEnabled(): Promise<boolean> {
-    return invoke("get_codex_model_routing_enabled");
-  },
-
-  async setCodexModelRoutingEnabled(enabled: boolean): Promise<void> {
-    return invoke("set_codex_model_routing_enabled", { enabled });
-  },
-
   // ========== 计费默认配置 API ==========
 
   // 获取默认成本倍率

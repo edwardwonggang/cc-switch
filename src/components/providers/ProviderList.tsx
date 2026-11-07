@@ -32,6 +32,11 @@ import {
 } from "@/hooks/useHermes";
 import { useStreamCheck } from "@/hooks/useStreamCheck";
 import { ProviderCard } from "@/components/providers/ProviderCard";
+import {
+  CodexUnifiedProviderCard,
+  CODEX_UNIFIED_PROVIDER_ID,
+  isCodexUnifiedProvider,
+} from "./CodexUnifiedProviderCard";
 import { ProviderEmptyState } from "@/components/providers/ProviderEmptyState";
 import {
   useAutoFailoverEnabled,
@@ -95,8 +100,28 @@ export function ProviderList({
 }: ProviderListProps) {
   const { t } = useTranslation();
   const { checkProvider, isChecking } = useStreamCheck(appId);
+  const ordinaryProviders = useMemo(
+    () =>
+      appId === "codex"
+        ? Object.fromEntries(
+            Object.entries(providers).filter(
+              ([, provider]) => !isCodexUnifiedProvider(provider),
+            ),
+          )
+        : providers,
+    [providers, appId],
+  );
+  const unifiedCard =
+    appId === "codex" ? (
+      <CodexUnifiedProviderCard
+        provider={providers[CODEX_UNIFIED_PROVIDER_ID]}
+        providers={providers}
+        isCurrent={currentProviderId === CODEX_UNIFIED_PROVIDER_ID}
+        onSwitch={onSwitch}
+      />
+    ) : null;
   const { sortedProviders, sensors, handleDragEnd } = useDragSort(
-    providers,
+    ordinaryProviders,
     appId,
   );
 
@@ -401,6 +426,7 @@ export function ProviderList({
   if (isLoading) {
     return (
       <div className="space-y-3">
+        {unifiedCard}
         {[0, 1, 2].map((index) => (
           <div
             key={index}
@@ -414,6 +440,7 @@ export function ProviderList({
   if (sortedProviders.length === 0) {
     return (
       <div className="mt-4 space-y-4">
+        {unifiedCard}
         {piStateErrorNotice}
         <ProviderEmptyState
           appId={appId}
@@ -523,6 +550,7 @@ export function ProviderList({
 
   return (
     <div className="mt-4 space-y-4">
+      {unifiedCard}
       {piStateErrorNotice}
       {claudeDesktopStatusMessages.length > 0 && (
         <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-900 dark:text-amber-200">

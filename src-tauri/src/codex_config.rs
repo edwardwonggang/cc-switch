@@ -246,6 +246,27 @@ impl CodexModelCatalogFileSnapshot {
     }
 }
 
+/// Unified routing only owns config/catalog. Avoid rolling auth.json back when
+/// a member edit fails while an independent Codex process refreshes its login.
+pub(crate) struct CodexRoutingFileSnapshot {
+    config: CodexLiveFileState,
+    catalog: CodexLiveFileState,
+}
+
+impl CodexRoutingFileSnapshot {
+    pub(crate) fn capture() -> Result<Self, AppError> {
+        Ok(Self {
+            config: CodexLiveFileState::capture(get_codex_config_path())?,
+            catalog: CodexLiveFileState::capture(get_codex_model_catalog_path())?,
+        })
+    }
+
+    pub(crate) fn restore(&self) -> Result<(), AppError> {
+        self.config.restore()?;
+        self.catalog.restore()
+    }
+}
+
 /// Exact rollback state for a managed Codex live write. The generated catalog
 /// and ownership marker are part of the same logical commit as auth/config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2700,7 +2721,12 @@ pub fn prepare_codex_live_config_text_with_optional_catalog(
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<String, AppError> {
-    if settings.get("modelCatalog").is_some() {
+    if let Some(catalog) = settings.get("unifiedModelCatalog") {
+        // This is a derived snapshot assembled from member-owned profiles.
+        // Preserve it during takeover recovery instead of applying one global
+        // provider profile to every model or dropping its live-file pointer.
+        prepare_codex_config_text_with_catalog_projection(config_text, catalog)
+    } else if settings.get("modelCatalog").is_some() {
         prepare_codex_config_text_with_model_catalog(settings, config_text, profile)
     } else {
         Ok(config_text.to_string())

@@ -19,16 +19,6 @@ const TEMPLATE_TYPE_BALANCE: &str = "balance";
 const TEMPLATE_TYPE_OFFICIAL_SUBSCRIPTION: &str = "official_subscription";
 const COPILOT_UNIT_PREMIUM: &str = "requests";
 
-fn refresh_codex_model_catalog_after_change(
-    state: &AppState,
-    app_type: &AppType,
-) -> Result<(), String> {
-    if matches!(app_type, AppType::Codex) {
-        futures::executor::block_on(state.proxy_service.refresh_codex_model_routing_catalog())?;
-    }
-    Ok(())
-}
-
 /// 获取所有供应商
 #[tauri::command]
 pub fn get_providers(
@@ -53,6 +43,9 @@ pub async fn add_provider(
     #[allow(non_snake_case)] addToLive: Option<bool>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if crate::proxy::model_routing::is_unified(&provider) {
+        return Err("请使用内置 Codex 卡片勾选供应商".to_string());
+    }
     let add_to_live = addToLive.unwrap_or(true);
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle
@@ -60,7 +53,6 @@ pub async fn add_provider(
             .ok_or_else(|| "应用状态不可用".to_string())?;
         let added = ProviderService::add(state.inner(), app_type.clone(), provider, add_to_live)
             .map_err(|e| e.to_string())?;
-        refresh_codex_model_catalog_after_change(state.inner(), &app_type)?;
         Ok(added)
     })
     .await
@@ -75,6 +67,11 @@ pub async fn update_provider(
     #[allow(non_snake_case)] originalId: Option<String>,
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
+    if crate::proxy::model_routing::is_unified(&provider)
+        || originalId.as_deref() == Some(crate::proxy::model_routing::UNIFIED_PROVIDER_ID)
+    {
+        return Err("内置 Codex 卡片只能配置成员，不能修改名称或身份".to_string());
+    }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app_handle
             .try_state::<AppState>()
@@ -86,7 +83,6 @@ pub async fn update_provider(
             provider,
         )
         .map_err(|e| e.to_string())?;
-        refresh_codex_model_catalog_after_change(state.inner(), &app_type)?;
         Ok(updated)
     })
     .await
@@ -101,7 +97,6 @@ pub fn delete_provider(
 ) -> Result<bool, String> {
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     ProviderService::delete(state.inner(), app_type.clone(), &id).map_err(|e| e.to_string())?;
-    refresh_codex_model_catalog_after_change(state.inner(), &app_type)?;
     Ok(true)
 }
 
@@ -886,7 +881,6 @@ pub fn update_providers_sort_order(
     let app_type = AppType::from_str(&app).map_err(|e| e.to_string())?;
     let updated = ProviderService::update_sort_order(state.inner(), app_type.clone(), updates)
         .map_err(|e| e.to_string())?;
-    refresh_codex_model_catalog_after_change(state.inner(), &app_type)?;
     Ok(updated)
 }
 

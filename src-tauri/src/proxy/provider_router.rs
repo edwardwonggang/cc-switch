@@ -17,7 +17,8 @@ use tokio::sync::RwLock;
 /// account boundary, so these cards must never participate in provider retry.
 pub(crate) fn provider_supports_failover(app_type: &str, provider: &Provider) -> bool {
     app_type != AppType::Codex.as_str()
-        || !crate::proxy::providers::is_codex_official_provider(provider)
+        || (!crate::proxy::providers::is_codex_official_provider(provider)
+            && !super::model_routing::is_unified(provider))
 }
 
 /// 供应商路由器
@@ -31,6 +32,7 @@ pub struct ProviderRouter {
 pub struct ProviderSelection {
     pub providers: Vec<Provider>,
     pub model_routed: bool,
+    pub upstream_model: Option<String>,
 }
 
 impl ProviderRouter {
@@ -47,44 +49,20 @@ impl ProviderRouter {
         app_type: &str,
         model: &str,
     ) -> Result<ProviderSelection, AppError> {
-        if app_type == "codex" && super::model_routing::enabled(&self.db)? {
-            let providers = self.db.get_all_providers(app_type)?;
-            let matches: Vec<Provider> = providers
-                .into_values()
-                .filter(|provider| super::model_routing::supports_model(provider, model))
-                .collect();
-            if !matches.is_empty() {
-                let config = self.db.get_proxy_config_for_app(app_type).await?;
-                let mut available = Vec::new();
-                for provider in matches {
-                    if !config.auto_failover_enabled {
-                        available.push(provider);
-                        break;
-                    }
-                    let key = format!("{app_type}:{}", provider.id);
-                    if self
-                        .get_or_create_circuit_breaker(&key)
-                        .await
-                        .is_available()
-                        .await
-                    {
-                        available.push(provider);
-                    }
-                }
-                if available.is_empty() {
-                    return Err(AppError::AllProvidersCircuitOpen);
-                }
+        if app_type == "codex" {
+            if let Some(unified) = super::model_routing::active(&self.db)? {
+                let route = super::model_routing::resolve(&self.db, &unified, model)?;
                 return Ok(ProviderSelection {
-                    providers: available,
+                    providers: vec![route.provider],
                     model_routed: true,
+                    upstream_model: Some(route.preview.actual_model),
                 });
             }
         }
-        // Unlisted models and disabled mode preserve the complete legacy route,
-        // including current-provider and failover-queue semantics.
         Ok(ProviderSelection {
             providers: self.select_providers(app_type).await?,
             model_routed: false,
+            upstream_model: None,
         })
     }
 
@@ -433,149 +411,118 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn model_routing_exact_candidates_preserve_default_and_legacy_fallback() {
+    async fn unified_provider_aliases_select_exact_members_and_normal_mode_is_unchanged() {
         let _home = TempHome::new();
         let db = Arc::new(Database::memory().unwrap());
-        for (id, model, sort) in [
-            ("default", "Default", 0),
-            ("b", "Model-B", 1),
-            ("b2", "Model-B", 2),
-        ] {
-            let mut provider = Provider::with_id(
-                id.to_string(),
-                id.to_string(),
-                json!({"modelCatalog": {"models": [{"model": model}]}}),
-                None,
-            );
-            provider.sort_index = Some(sort);
-            db.save_provider("codex", &provider).unwrap();
+        for (id, name) in [("a", "A"), ("b", "B")] {
+            db.save_provider(
+                "codex",
+                &Provider::with_id(
+                    id.to_string(),
+                    name.to_string(),
+                    json!({"modelCatalog": {"models": [{"model": "deepseek-v4-flash"}]}}),
+                    None,
+                ),
+            )
+            .unwrap();
         }
-        db.set_current_provider("codex", "default").unwrap();
+        db.set_current_provider("codex", "a").unwrap();
+        crate::settings::set_current_provider(&AppType::Codex, Some("a")).unwrap();
+        // The previous experimental setting has no effect on ordinary cards.
+        db.set_setting("codex_model_routing_enabled", "true")
+            .unwrap();
         let router = ProviderRouter::new(db.clone());
-        let legacy = router
-            .select_providers_for_model("codex", "Model-B")
+        let normal = router
+            .select_providers_for_model("codex", "deepseek-v4-flash")
             .await
             .unwrap();
-        assert!(!legacy.model_routed);
-        assert_eq!(legacy.providers[0].id, "default");
-        db.set_setting(
-            super::super::model_routing::CODEX_MODEL_ROUTING_SETTING,
-            "true",
-        )
-        .unwrap();
-        let selected = router
-            .select_providers_for_model("codex", "Model-B")
-            .await
-            .unwrap();
-        assert!(selected.model_routed);
-        assert_eq!(
-            selected
-                .providers
-                .iter()
-                .map(|p| p.id.as_str())
-                .collect::<Vec<_>>(),
-            ["b"]
-        );
+        assert!(!normal.model_routed);
+        assert_eq!(normal.providers[0].id, "a");
+        let mut unified = super::super::model_routing::builtin();
+        unified.settings_config["memberProviderIds"] = json!(["a", "b"]);
+        db.save_provider("codex", &unified).unwrap();
+        db.set_current_provider("codex", &unified.id).unwrap();
+        crate::settings::set_current_provider(&AppType::Codex, Some(&unified.id)).unwrap();
         let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
         config.auto_failover_enabled = true;
         db.update_proxy_config_for_app(config).await.unwrap();
-        // Even with an unrelated legacy failover queue, known models must only
-        // try their own ordered candidates.
-        db.add_to_failover_queue("codex", "default").unwrap();
-        let selected = router
-            .select_providers_for_model("codex", "Model-B")
-            .await
-            .unwrap();
-        assert_eq!(
-            selected
-                .providers
-                .iter()
-                .map(|p| p.id.as_str())
-                .collect::<Vec<_>>(),
-            ["b", "b2"]
-        );
-        for unknown in ["model-b", "Model-B-Thinking", "unknown"] {
+        db.add_to_failover_queue("codex", "a").unwrap();
+        for (alias, expected) in [("A-deepseek-v4-flash", "a"), ("B-deepseek-v4-flash", "b")] {
             let selected = router
-                .select_providers_for_model("codex", unknown)
+                .select_providers_for_model("codex", alias)
                 .await
                 .unwrap();
-            assert!(!selected.model_routed);
-            assert_eq!(selected.providers[0].id, "default");
+            assert!(selected.model_routed);
+            assert_eq!(selected.providers.len(), 1);
+            assert_eq!(selected.providers[0].id, expected);
+            assert_eq!(
+                selected.upstream_model.as_deref(),
+                Some("deepseek-v4-flash")
+            );
+        }
+        for unknown in ["deepseek-v4-flash", "a-deepseek-v4-flash", "unknown"] {
+            assert!(matches!(
+                router.select_providers_for_model("codex", unknown).await,
+                Err(AppError::InvalidInput(_))
+            ));
         }
         assert_eq!(
             db.get_current_provider("codex").unwrap().as_deref(),
-            Some("default")
-        );
-        db.set_setting(
-            super::super::model_routing::CODEX_MODEL_ROUTING_SETTING,
-            "false",
-        )
-        .unwrap();
-        assert!(
-            !router
-                .select_providers_for_model("codex", "Model-B")
-                .await
-                .unwrap()
-                .model_routed
+            Some(unified.id.as_str())
         );
     }
 
     #[test]
     #[serial]
-    fn model_routing_catalog_keeps_each_provider_profile_and_first_duplicate() {
+    fn unified_provider_catalog_preserves_profiles_and_collision_aliases_are_stable() {
         let _home = TempHome::new();
         let db = Database::memory().unwrap();
-        for (id, format, sort, models) in [
-            (
-                "chat",
-                "openai_chat",
-                0,
-                json!([
-                    {"model": "Shared", "displayName": "first", "contextWindow": 123456,
-                     "reasoningLevels": ["low", "high"], "defaultReasoningLevel": "low"},
-                    {"model": "ChatOnly", "contextWindow": 234567}
-                ]),
-            ),
-            (
-                "anthropic",
-                "anthropic",
-                1,
-                json!([
-                    {"model": "Shared", "displayName": "second", "contextWindow": 999999},
-                    {"model": "ClaudeOnly", "contextWindow": 345678, "baseInstructions": "provider-owned instructions",
-                     "inputModalities": ["text"], "supportsParallelToolCalls": false}
-                ]),
-            ),
+        for (id, name, format, context) in [
+            ("a", "公司 A", "openai_chat", 123456),
+            ("b", "B", "anthropic", 345678),
         ] {
             let mut provider = Provider::with_id(
                 id.to_string(),
-                id.to_string(),
-                json!({"config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:1/v1\"\nwire_api = \"responses\"\n",
-                       "modelCatalog": {"models": models}}),
+                name.to_string(),
+                json!({
+                    "config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:1/v1\"\nwire_api = \"responses\"\n",
+                    "modelCatalog": {"models": [{"model": "DeepSeek-v4-Flash", "contextWindow": context,
+                        "reasoningLevels": ["low", "high"], "defaultReasoningLevel": "low",
+                        "baseInstructions": "member-owned", "inputModalities": ["text"], "supportsParallelToolCalls": false}]}
+                }),
                 None,
             );
-            provider.sort_index = Some(sort);
             provider.meta = Some(crate::provider::ProviderMeta {
                 api_format: Some(format.to_string()),
                 ..Default::default()
             });
             db.save_provider("codex", &provider).unwrap();
         }
-        let catalog = super::super::model_routing::combined_catalog(&db).unwrap();
+        let mut unified = super::super::model_routing::builtin();
+        unified.settings_config["memberProviderIds"] = json!(["a", "b"]);
+        let catalog = super::super::model_routing::catalog(&db, &unified).unwrap();
         let models = catalog["models"].as_array().unwrap();
-        assert_eq!(models.len(), 3);
-        assert_eq!(models[0]["slug"], "Shared");
-        assert_eq!(models[0]["display_name"], "first");
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["slug"], "公司-A-DeepSeek-v4-Flash");
         assert_eq!(models[0]["context_window"], 123456);
-        assert_eq!(models[0]["default_reasoning_level"], "low");
-        assert_eq!(
-            models[2]["base_instructions"],
-            "provider-owned instructions"
-        );
-        assert_eq!(models[2]["input_modalities"], json!(["text"]));
-        assert_eq!(models[2]["supports_parallel_tool_calls"], false);
-        assert!(models[2].get("apply_patch_tool_type").is_none());
-        assert_eq!(models[2]["shell_type"], "shell_command");
+        assert_eq!(models[1]["context_window"], 345678);
+        assert_eq!(models[1]["base_instructions"], "member-owned");
+        assert_eq!(models[1]["default_reasoning_level"], "low");
+        assert!(models[1].get("apply_patch_tool_type").is_none());
+        assert_eq!(models[1]["shell_type"], "shell_command");
+        let mut b = db.get_provider_by_id("b", "codex").unwrap().unwrap();
+        b.name = "公司 A".to_string();
+        db.save_provider("codex", &b).unwrap();
+        let first = super::super::model_routing::routes(&db, &unified).unwrap();
+        assert_ne!(first[0].preview.alias, first[1].preview.alias);
+        let identity: std::collections::HashMap<_, _> = first
+            .into_iter()
+            .map(|r| (r.preview.provider_id, r.preview.alias))
+            .collect();
+        unified.settings_config["memberProviderIds"] = json!(["b", "a"]);
+        for route in super::super::model_routing::routes(&db, &unified).unwrap() {
+            assert_eq!(identity[&route.preview.provider_id], route.preview.alias);
+        }
     }
 
     #[tokio::test]

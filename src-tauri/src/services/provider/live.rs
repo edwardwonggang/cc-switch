@@ -676,7 +676,13 @@ pub(crate) fn build_effective_settings_with_common_config(
     provider: &Provider,
 ) -> Result<Value, AppError> {
     let snippet = db.get_config_snippet(app_type.as_str())?;
-    let mut effective_settings = provider.settings_config.clone();
+    let mut effective_settings = if matches!(app_type, AppType::Codex)
+        && crate::proxy::model_routing::is_unified(provider)
+    {
+        crate::proxy::model_routing::live_settings(db, provider)?
+    } else {
+        provider.settings_config.clone()
+    };
 
     if provider_uses_common_config(app_type, provider, snippet.as_deref()) {
         if let Some(snippet_text) = snippet.as_deref() {
@@ -946,6 +952,9 @@ pub(crate) fn strip_common_config_from_live_settings(
     provider: &Provider,
     live_settings: Value,
 ) -> Value {
+    if matches!(app_type, AppType::Codex) && crate::proxy::model_routing::is_unified(provider) {
+        return provider.settings_config.clone();
+    }
     let snippet = match db.get_config_snippet(app_type.as_str()) {
         Ok(snippet) => snippet,
         Err(err) => {
@@ -1168,6 +1177,9 @@ pub(crate) fn normalize_provider_common_config_for_storage(
     app_type: &AppType,
     provider: &mut Provider,
 ) -> Result<(), AppError> {
+    if matches!(app_type, AppType::Codex) && crate::proxy::model_routing::is_unified(provider) {
+        return Ok(());
+    }
     let uses_common_config = provider
         .meta
         .as_ref()
@@ -1289,6 +1301,22 @@ pub(crate) fn write_live_snapshot(app_type: &AppType, provider: &Provider) -> Re
             ));
         }
         AppType::Codex => {
+            if crate::proxy::model_routing::is_unified(provider) {
+                let config = provider
+                    .settings_config
+                    .get("config")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| AppError::Config("统一供应商缺少本地路由配置".to_string()))?;
+                let catalog = provider
+                    .settings_config
+                    .get("unifiedModelCatalog")
+                    .ok_or_else(|| AppError::Config("统一供应商缺少模型目录".to_string()))?;
+                let prepared =
+                    crate::codex_config::prepare_codex_config_text_with_catalog_projection(
+                        config, catalog,
+                    )?;
+                return crate::codex_config::write_codex_live_config_atomic(Some(&prepared));
+            }
             let obj = provider
                 .settings_config
                 .as_object()

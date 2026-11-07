@@ -42,6 +42,7 @@ pub struct RequestContext {
     /// 完整的 Provider 列表（用于故障转移）
     providers: Vec<Provider>,
     model_routed: bool,
+    upstream_model: Option<String>,
     /// 请求开始时的"当前供应商"（用于判断是否需要同步 UI/托盘）
     ///
     /// 这里使用本地 settings 的设备级 current provider。
@@ -141,6 +142,9 @@ impl RequestContext {
                     ProxyError::AllProvidersCircuitOpen
                 }
                 crate::error::AppError::NoProvidersConfigured => ProxyError::NoProvidersConfigured,
+                crate::error::AppError::InvalidInput(message) => {
+                    ProxyError::InvalidRequest(message)
+                }
                 _ => ProxyError::DatabaseError(e.to_string()),
             })?;
 
@@ -165,6 +169,7 @@ impl RequestContext {
             provider,
             providers,
             model_routed: selection.model_routed,
+            upstream_model: selection.upstream_model,
             current_provider_id,
             request_model,
             outbound_model: None,
@@ -246,6 +251,7 @@ impl RequestContext {
             max_retries,
         )
         .with_model_routing(self.model_routed)
+        .with_upstream_model(self.upstream_model.clone())
     }
 
     /// 获取 Provider 列表（用于故障转移）

@@ -17,22 +17,6 @@ fn require_proxy_app(app_type: &str) -> Result<crate::app_config::AppType, Strin
     Ok(app)
 }
 
-#[tauri::command]
-pub fn get_codex_model_routing_enabled(state: tauri::State<'_, AppState>) -> Result<bool, String> {
-    crate::proxy::model_routing::enabled(&state.db).map_err(|error| error.to_string())
-}
-
-#[tauri::command]
-pub async fn set_codex_model_routing_enabled(
-    state: tauri::State<'_, AppState>,
-    enabled: bool,
-) -> Result<(), String> {
-    state
-        .proxy_service
-        .set_codex_model_routing_enabled(enabled)
-        .await
-}
-
 /// 启动代理服务器（仅启动服务，不接管 Live 配置）
 #[tauri::command]
 pub async fn start_proxy_server(
@@ -375,7 +359,9 @@ pub async fn reset_circuit_breaker(
     // Model routes re-evaluate their own candidate priority on the next
     // request; recovery must not replace the user's global fallback provider.
     if app_type == "codex"
-        && crate::proxy::model_routing::enabled(db).map_err(|error| error.to_string())?
+        && crate::proxy::model_routing::active(db)
+            .map_err(|error| error.to_string())?
+            .is_some()
     {
         return Ok(());
     }

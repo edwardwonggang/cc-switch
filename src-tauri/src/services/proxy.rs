@@ -716,60 +716,119 @@ impl ProxyService {
             .await
     }
 
-    pub async fn refresh_codex_model_routing_catalog(&self) -> Result<(), String> {
-        if !crate::proxy::model_routing::enabled(&self.db).map_err(|error| error.to_string())?
-            || !self.get_takeover_status().await?.codex
-        {
-            return Ok(());
-        }
+    pub async fn save_codex_unified_members(&self, ids: Vec<String>) -> Result<Provider, String> {
         let _guard = self.lock_switch_for_app("codex").await;
-        if let Some(provider) = self.get_current_provider_for_app(&AppType::Codex)? {
-            self.sync_codex_live_from_provider_while_proxy_active(&provider)
+        let mut provider = crate::proxy::model_routing::builtin();
+        provider.settings_config["memberProviderIds"] = json!(ids);
+        crate::proxy::model_routing::validate_change(&self.db, &provider)
+            .map_err(|error| error.to_string())?;
+        let is_current = crate::proxy::model_routing::active(&self.db)
+            .map_err(|error| error.to_string())?
+            .is_some();
+        // Saving checkboxes on an inactive card is DB-only. Never auto-select
+        // a first card or write user config merely because a member was checked.
+        if !is_current {
+            self.db
+                .save_provider("codex", &provider)
+                .map_err(|error| error.to_string())?;
+            return Ok(provider);
+        }
+        self.commit_codex_unified_projection(&provider, &provider)
+            .await?;
+        Ok(provider)
+    }
+
+    /// Caller holds the existing Codex provider-update switch lock.
+    pub(crate) async fn save_codex_unified_member_update_guarded(
+        &self,
+        provider: &Provider,
+    ) -> Result<bool, String> {
+        let Some(unified) =
+            crate::proxy::model_routing::active(&self.db).map_err(|error| error.to_string())?
+        else {
+            return Ok(false);
+        };
+        if !crate::proxy::model_routing::member_ids(&unified)
+            .map_err(|error| error.to_string())?
+            .contains(&provider.id)
+        {
+            return Ok(false);
+        }
+        self.commit_codex_unified_projection(provider, &unified)
+            .await?;
+        Ok(true)
+    }
+
+    async fn commit_codex_unified_projection(
+        &self,
+        provider: &Provider,
+        unified: &Provider,
+    ) -> Result<(), String> {
+        let previous = self
+            .db
+            .get_provider_by_id(&provider.id, "codex")
+            .map_err(|error| error.to_string())?;
+        let file_snapshot = crate::codex_config::CodexRoutingFileSnapshot::capture()
+            .map_err(|error| error.to_string())?;
+        let backup = self
+            .db
+            .get_live_backup("codex")
+            .await
+            .map_err(|error| error.to_string())?;
+        self.db
+            .save_provider("codex", provider)
+            .map_err(|error| error.to_string())?;
+        let result: Result<(), String> = async {
+            self.sync_codex_live_from_provider_while_proxy_active(unified)
                 .await?;
+            self.update_live_backup_from_provider_inner("codex", unified, None)
+                .await?;
+            Ok(())
+        }
+        .await;
+        if let Err(error) = result {
+            if let Some(previous) = previous {
+                self.db
+                    .save_provider("codex", &previous)
+                    .map_err(|rollback| format!("{error}; 恢复成员配置失败: {rollback}"))?;
+            } else {
+                self.db
+                    .delete_provider("codex", &provider.id)
+                    .map_err(|rollback| format!("{error}; 移除未提交配置失败: {rollback}"))?;
+            }
+            file_snapshot
+                .restore()
+                .map_err(|rollback| format!("{error}; 恢复客户端配置与模型目录失败: {rollback}"))?;
+            if let Some(backup) = backup {
+                self.db
+                    .save_live_backup("codex", &backup.original_config)
+                    .await
+                    .map_err(|rollback| format!("{error}; 恢复代理备份失败: {rollback}"))?;
+            }
+            return Err(error);
         }
         Ok(())
     }
 
-    pub async fn set_codex_model_routing_enabled(&self, enabled: bool) -> Result<(), String> {
-        let _guard = self.lock_switch_for_app("codex").await;
-        let taken_over = self.get_takeover_status().await?.codex;
-        if enabled && !taken_over {
-            return Err("请先启用 Codex 本地路由接管，再开启多供应商模型路由".to_string());
-        }
-        let provider = self.get_current_provider_for_app(&AppType::Codex)?;
-        if enabled
-            && provider.as_ref().is_none_or(|provider| {
-                crate::proxy::providers::is_codex_official_provider(provider)
-            })
-        {
-            return Err("请先选择第三方 API 供应商作为默认，再开启多供应商模型路由".to_string());
-        }
-        let old =
-            crate::proxy::model_routing::enabled(&self.db).map_err(|error| error.to_string())?;
-        // Validate every provider's generated catalog before changing the mode.
-        if enabled {
-            crate::proxy::model_routing::combined_catalog(&self.db)
-                .map_err(|error| error.to_string())?;
-        }
-        let key = crate::proxy::model_routing::CODEX_MODEL_ROUTING_SETTING;
-        self.db
-            .set_setting(key, if enabled { "true" } else { "false" })
+    pub async fn activate_codex_unified_provider(&self) -> Result<(), String> {
+        let provider = self
+            .db
+            .get_provider_by_id(crate::proxy::model_routing::UNIFIED_PROVIDER_ID, "codex")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "请先在 Codex 卡片中勾选供应商".to_string())?;
+        crate::proxy::model_routing::live_settings(&self.db, &provider)
             .map_err(|error| error.to_string())?;
-        if taken_over {
-            if let Some(provider) = provider {
-                if let Err(error) = self
-                    .sync_codex_live_from_provider_while_proxy_active(&provider)
+        let was_taken_over = self.get_takeover_status().await?.codex;
+        if !was_taken_over {
+            self.set_takeover_for_app("codex", true).await?;
+        }
+        if let Err(error) = self.hot_switch_provider("codex", &provider.id).await {
+            if !was_taken_over {
+                self.set_takeover_for_app("codex", false)
                     .await
-                {
-                    self.db
-                        .set_setting(key, if old { "true" } else { "false" })
-                        .map_err(|rollback| format!("{error}; 回滚路由开关失败: {rollback}"))?;
-                    self.sync_codex_live_from_provider_while_proxy_active(&provider)
-                        .await
-                        .map_err(|rollback| format!("{error}; 回滚模型目录失败: {rollback}"))?;
-                    return Err(error);
-                }
+                    .map_err(|rollback| format!("{error}; 恢复原接管状态失败: {rollback}"))?;
             }
+            return Err(error);
         }
         Ok(())
     }
@@ -1214,6 +1273,14 @@ impl ProxyService {
         if !app.supports_local_proxy() {
             return Err(format!("{} 不支持本地路由", app.as_str()));
         }
+        if !enabled
+            && app == AppType::Codex
+            && crate::proxy::model_routing::active(&self.db)
+                .map_err(|error| error.to_string())?
+                .is_some()
+        {
+            return Err("请先切回普通供应商，再关闭 Codex 本地接管".to_string());
+        }
         let app_type_str = app.as_str();
         let _guard = self.switch_locks.lock_for_app(app_type_str).await;
 
@@ -1604,7 +1671,9 @@ impl ProxyService {
                         // Official rows are routing/account selectors, not
                         // credential stores. Their auth must remain empty even
                         // when the live Codex login uses OPENAI_API_KEY mode.
-                        if crate::proxy::providers::is_codex_official_provider(&provider) {
+                        if crate::proxy::providers::is_codex_official_provider(&provider)
+                            || crate::proxy::model_routing::is_unified(&provider)
+                        {
                             return Ok(());
                         }
                         if let Some(token) = live_config
@@ -1811,6 +1880,12 @@ impl ProxyService {
     ///
     /// 会清除 settings 表中的代理状态，下次启动不会自动恢复。
     pub async fn stop_with_restore(&self) -> Result<(), String> {
+        if crate::proxy::model_routing::active(&self.db)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("请先切回普通供应商，再停止统一供应商使用的本地代理".to_string());
+        }
         // 1. 停止代理服务器（即使未运行也继续执行恢复逻辑）
         if let Err(e) = self.stop().await {
             log::warn!("停止代理服务器失败（将继续恢复 Live 配置）: {e}");
@@ -3736,21 +3811,20 @@ impl ProxyService {
             let profile = provider
                 .map(crate::proxy::providers::resolve_codex_catalog_tool_profile)
                 .unwrap_or(crate::codex_config::CodexCatalogToolProfile::ProxyChat);
-            let prepared_config = if !official_passthrough
-                && crate::proxy::model_routing::enabled(&self.db)
-                    .map_err(|error| error.to_string())?
-            {
-                let catalog = crate::proxy::model_routing::combined_catalog(&self.db)
-                    .map_err(|error| error.to_string())?;
-                crate::codex_config::prepare_codex_config_text_with_catalog_projection(
-                    config_str, &catalog,
-                )
-            } else {
-                crate::codex_config::prepare_codex_live_config_text_with_optional_catalog(
-                    config, config_str, profile,
-                )
-            }
-            .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+            let prepared_config =
+                if provider.is_some_and(crate::proxy::model_routing::is_unified) {
+                    let catalog = config
+                        .get("unifiedModelCatalog")
+                        .ok_or_else(|| "统一供应商缺少生成的模型目录".to_string())?;
+                    crate::codex_config::prepare_codex_config_text_with_catalog_projection(
+                        config_str, catalog,
+                    )
+                } else {
+                    crate::codex_config::prepare_codex_live_config_text_with_optional_catalog(
+                        config, config_str, profile,
+                    )
+                }
+                .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
             if managed_official {
                 let auth = config
                     .get("auth")
