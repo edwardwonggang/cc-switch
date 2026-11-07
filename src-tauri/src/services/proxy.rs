@@ -9996,6 +9996,170 @@ base_url = "https://third.example/v1"
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn recover_from_crash_keeps_live_codex_api_key_and_catalog() {
+        for backup_auth in [json!({ "OPENAI_API_KEY": "stale-backup-key" }), json!({})] {
+            let home = TempHome::new();
+            crate::settings::reload_settings().expect("reload isolated settings");
+            assert_eq!(
+                crate::codex_config::get_codex_config_dir(),
+                home.dir.path().join(".codex"),
+                "recovery fixtures must never use the real Codex directory"
+            );
+
+            let db = Arc::new(Database::memory().expect("init isolated db"));
+            let service = ProxyService::new(db.clone());
+            let catalog_path = crate::codex_config::get_codex_model_catalog_path();
+            let pointer = catalog_path.to_string_lossy().replace('\\', "/");
+            let backup_config = format!(
+                "model_provider = \"custom\"\n\
+                 model = \"test-model\"\n\
+                 model_catalog_json = \"{pointer}\"\n\n\
+                 [model_providers.custom]\n\
+                 name = \"Recovery test\"\n\
+                 base_url = \"https://recovery.example/v1\"\n\
+                 wire_api = \"responses\"\n\
+                 experimental_bearer_token = \"stale-config-key\"\n"
+            );
+            let provider = Provider::with_id(
+                "current-provider".to_string(),
+                "Current Provider".to_string(),
+                json!({ "auth": { "OPENAI_API_KEY": "provider-key" }, "config": backup_config }),
+                None,
+            );
+            db.save_provider("codex", &provider).expect("save provider");
+            db.set_current_provider("codex", &provider.id)
+                .expect("set DB current");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+                .expect("set local current");
+            let mut proxy_config = db.get_proxy_config_for_app("codex").await.unwrap();
+            proxy_config.enabled = true;
+            db.update_proxy_config_for_app(proxy_config).await.unwrap();
+            db.save_live_backup(
+                "codex",
+                &json!({ "auth": backup_auth, "config": backup_config }).to_string(),
+            )
+            .await
+            .expect("save stale takeover backup");
+
+            let auth_path = crate::codex_config::get_codex_auth_path();
+            std::fs::create_dir_all(auth_path.parent().unwrap())
+                .expect("create isolated Codex dir");
+            let auth_bytes = b"{\"OPENAI_API_KEY\":\"live-restored-key\"}\n";
+            std::fs::write(&auth_path, auth_bytes).expect("seed restored live API key");
+            let catalog_bytes = br#"{"models":[{"slug":"test-model"}]}"#;
+            std::fs::write(&catalog_path, catalog_bytes).expect("seed live catalog");
+            std::fs::write(
+                crate::codex_config::get_codex_config_path(),
+                "model_provider = [",
+            )
+            .expect("seed broken config independently of valid auth");
+
+            service.recover_from_crash().await.expect("recover Codex");
+
+            assert_eq!(
+                std::fs::read(&auth_path).expect("read recovered auth"),
+                auth_bytes,
+                "crash recovery must not overwrite a live API key with the older backup"
+            );
+            let restored_config =
+                std::fs::read_to_string(crate::codex_config::get_codex_config_path())
+                    .expect("read recovered config");
+            assert_eq!(
+                crate::codex_config::extract_codex_experimental_bearer_token(&restored_config)
+                    .as_deref(),
+                Some("live-restored-key"),
+                "the restored request must not keep a stale provider-scoped bearer token"
+            );
+            let restored: toml::Value = toml::from_str(&restored_config).expect("parse config");
+            assert_eq!(
+                restored
+                    .get("model_catalog_json")
+                    .and_then(toml::Value::as_str),
+                Some(pointer.as_str())
+            );
+            assert_eq!(
+                std::fs::read(&catalog_path).expect("read recovered catalog"),
+                catalog_bytes
+            );
+            assert_eq!(
+                db.get_provider_by_id(&provider.id, "codex")
+                    .expect("read provider")
+                    .expect("provider remains")
+                    .settings_config,
+                provider.settings_config,
+                "recovery must not write the live key into the provider SSOT"
+            );
+            assert_eq!(
+                db.get_current_provider("codex").unwrap().as_deref(),
+                Some(provider.id.as_str())
+            );
+            assert_eq!(
+                crate::settings::get_current_provider(&AppType::Codex).as_deref(),
+                Some(provider.id.as_str())
+            );
+            assert!(db.get_proxy_config_for_app("codex").await.unwrap().enabled);
+            assert!(!db.has_any_live_backup().await.unwrap());
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_from_crash_restores_codex_backup_when_live_key_is_unusable() {
+        for live_auth in [
+            None,
+            Some(json!({ "OPENAI_API_KEY": PROXY_TOKEN_PLACEHOLDER })),
+            Some(json!({ "OPENAI_API_KEY": "   " })),
+            Some(json!({
+                "last_refresh": "2026-11-07T00:00:00Z",
+                "tokens": { "account_id": "metadata-only" }
+            })),
+        ] {
+            let home = TempHome::new();
+            crate::settings::reload_settings().expect("reload isolated settings");
+            assert_eq!(
+                crate::codex_config::get_codex_config_dir(),
+                home.dir.path().join(".codex")
+            );
+            let db = Arc::new(Database::memory().expect("init isolated db"));
+            let service = ProxyService::new(db.clone());
+            let backup = json!({
+                "auth": { "OPENAI_API_KEY": "valid-backup-key" },
+                "config": "model_provider = \"custom\"\n"
+            });
+            let provider = Provider::with_id(
+                "third-party".to_string(),
+                "Third Party".to_string(),
+                backup.clone(),
+                None,
+            );
+            db.save_provider("codex", &provider).expect("save provider");
+            db.set_current_provider("codex", &provider.id)
+                .expect("set DB current");
+            crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id))
+                .expect("set local current");
+            db.save_live_backup("codex", &backup.to_string())
+                .await
+                .expect("seed backup");
+            if let Some(auth) = live_auth {
+                write_json_file(&crate::codex_config::get_codex_auth_path(), &auth)
+                    .expect("seed unusable live auth");
+            }
+
+            service.recover_from_crash().await.expect("recover Codex");
+
+            let restored: Value =
+                read_json_file(&crate::codex_config::get_codex_auth_path()).expect("read auth");
+            assert_eq!(restored, backup["auth"]);
+            assert!(!db.has_any_live_backup().await.unwrap());
+            assert_eq!(
+                db.get_current_provider("codex").unwrap().as_deref(),
+                Some(provider.id.as_str())
+            );
+        }
+    }
+
     /// The normal restore path (no login happened during takeover): live auth
     /// only carries the takeover placeholder, so the backup must be restored
     /// verbatim including its auth.json.
