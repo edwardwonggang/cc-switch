@@ -716,6 +716,64 @@ impl ProxyService {
             .await
     }
 
+    pub async fn refresh_codex_model_routing_catalog(&self) -> Result<(), String> {
+        if !crate::proxy::model_routing::enabled(&self.db).map_err(|error| error.to_string())?
+            || !self.get_takeover_status().await?.codex
+        {
+            return Ok(());
+        }
+        let _guard = self.lock_switch_for_app("codex").await;
+        if let Some(provider) = self.get_current_provider_for_app(&AppType::Codex)? {
+            self.sync_codex_live_from_provider_while_proxy_active(&provider)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn set_codex_model_routing_enabled(&self, enabled: bool) -> Result<(), String> {
+        let _guard = self.lock_switch_for_app("codex").await;
+        let taken_over = self.get_takeover_status().await?.codex;
+        if enabled && !taken_over {
+            return Err("请先启用 Codex 本地路由接管，再开启多供应商模型路由".to_string());
+        }
+        let provider = self.get_current_provider_for_app(&AppType::Codex)?;
+        if enabled
+            && provider.as_ref().is_none_or(|provider| {
+                crate::proxy::providers::is_codex_official_provider(provider)
+            })
+        {
+            return Err("请先选择第三方 API 供应商作为默认，再开启多供应商模型路由".to_string());
+        }
+        let old =
+            crate::proxy::model_routing::enabled(&self.db).map_err(|error| error.to_string())?;
+        // Validate every provider's generated catalog before changing the mode.
+        if enabled {
+            crate::proxy::model_routing::combined_catalog(&self.db)
+                .map_err(|error| error.to_string())?;
+        }
+        let key = crate::proxy::model_routing::CODEX_MODEL_ROUTING_SETTING;
+        self.db
+            .set_setting(key, if enabled { "true" } else { "false" })
+            .map_err(|error| error.to_string())?;
+        if taken_over {
+            if let Some(provider) = provider {
+                if let Err(error) = self
+                    .sync_codex_live_from_provider_while_proxy_active(&provider)
+                    .await
+                {
+                    self.db
+                        .set_setting(key, if old { "true" } else { "false" })
+                        .map_err(|rollback| format!("{error}; 回滚路由开关失败: {rollback}"))?;
+                    self.sync_codex_live_from_provider_while_proxy_active(&provider)
+                        .await
+                        .map_err(|rollback| format!("{error}; 回滚模型目录失败: {rollback}"))?;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn sync_codex_live_from_provider_while_proxy_active_guarded(
         &self,
         provider: &Provider,
@@ -3678,11 +3736,21 @@ impl ProxyService {
             let profile = provider
                 .map(crate::proxy::providers::resolve_codex_catalog_tool_profile)
                 .unwrap_or(crate::codex_config::CodexCatalogToolProfile::ProxyChat);
-            let prepared_config =
+            let prepared_config = if !official_passthrough
+                && crate::proxy::model_routing::enabled(&self.db)
+                    .map_err(|error| error.to_string())?
+            {
+                let catalog = crate::proxy::model_routing::combined_catalog(&self.db)
+                    .map_err(|error| error.to_string())?;
+                crate::codex_config::prepare_codex_config_text_with_catalog_projection(
+                    config_str, &catalog,
+                )
+            } else {
                 crate::codex_config::prepare_codex_live_config_text_with_optional_catalog(
                     config, config_str, profile,
                 )
-                .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
+            }
+            .map_err(|e| format!("写入 Codex 配置失败: {e}"))?;
             if managed_official {
                 let auth = config
                     .get("auth")

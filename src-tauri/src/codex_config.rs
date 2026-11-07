@@ -2274,6 +2274,25 @@ fn codex_model_catalog_from_specs(
     json!({ "models": entries })
 }
 
+pub(crate) fn build_codex_model_catalog_for_provider(
+    provider: &crate::provider::Provider,
+    settings: &Value,
+) -> Result<Option<Value>, AppError> {
+    let config_text = settings.get("config").and_then(Value::as_str).unwrap_or("");
+    let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
+    codex_model_catalog_from_settings(settings, config_text, profile)
+}
+
+pub(crate) fn prepare_codex_config_text_with_catalog_projection(
+    config_text: &str,
+    catalog: &Value,
+) -> Result<String, AppError> {
+    let path = get_codex_model_catalog_path();
+    let config_text = set_codex_model_catalog_json_field(config_text, Some(&path))?;
+    write_json_file(&path, catalog)?;
+    Ok(config_text)
+}
+
 fn codex_model_catalog_from_settings(
     settings: &Value,
     config_text: &str,

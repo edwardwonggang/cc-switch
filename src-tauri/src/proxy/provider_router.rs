@@ -28,6 +28,11 @@ pub struct ProviderRouter {
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
 }
 
+pub struct ProviderSelection {
+    pub providers: Vec<Provider>,
+    pub model_routed: bool,
+}
+
 impl ProviderRouter {
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
@@ -35,6 +40,52 @@ impl ProviderRouter {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    pub async fn select_providers_for_model(
+        &self,
+        app_type: &str,
+        model: &str,
+    ) -> Result<ProviderSelection, AppError> {
+        if app_type == "codex" && super::model_routing::enabled(&self.db)? {
+            let providers = self.db.get_all_providers(app_type)?;
+            let matches: Vec<Provider> = providers
+                .into_values()
+                .filter(|provider| super::model_routing::supports_model(provider, model))
+                .collect();
+            if !matches.is_empty() {
+                let config = self.db.get_proxy_config_for_app(app_type).await?;
+                let mut available = Vec::new();
+                for provider in matches {
+                    if !config.auto_failover_enabled {
+                        available.push(provider);
+                        break;
+                    }
+                    let key = format!("{app_type}:{}", provider.id);
+                    if self
+                        .get_or_create_circuit_breaker(&key)
+                        .await
+                        .is_available()
+                        .await
+                    {
+                        available.push(provider);
+                    }
+                }
+                if available.is_empty() {
+                    return Err(AppError::AllProvidersCircuitOpen);
+                }
+                return Ok(ProviderSelection {
+                    providers: available,
+                    model_routed: true,
+                });
+            }
+        }
+        // Unlisted models and disabled mode preserve the complete legacy route,
+        // including current-provider and failover-queue semantics.
+        Ok(ProviderSelection {
+            providers: self.select_providers(app_type).await?,
+            model_routed: false,
+        })
     }
 
     /// 选择可用的供应商（支持故障转移）
@@ -378,6 +429,153 @@ mod tests {
 
         let breaker = router.get_or_create_circuit_breaker("claude:test").await;
         assert!(breaker.allow_request().await.allowed);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn model_routing_exact_candidates_preserve_default_and_legacy_fallback() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+        for (id, model, sort) in [
+            ("default", "Default", 0),
+            ("b", "Model-B", 1),
+            ("b2", "Model-B", 2),
+        ] {
+            let mut provider = Provider::with_id(
+                id.to_string(),
+                id.to_string(),
+                json!({"modelCatalog": {"models": [{"model": model}]}}),
+                None,
+            );
+            provider.sort_index = Some(sort);
+            db.save_provider("codex", &provider).unwrap();
+        }
+        db.set_current_provider("codex", "default").unwrap();
+        let router = ProviderRouter::new(db.clone());
+        let legacy = router
+            .select_providers_for_model("codex", "Model-B")
+            .await
+            .unwrap();
+        assert!(!legacy.model_routed);
+        assert_eq!(legacy.providers[0].id, "default");
+        db.set_setting(
+            super::super::model_routing::CODEX_MODEL_ROUTING_SETTING,
+            "true",
+        )
+        .unwrap();
+        let selected = router
+            .select_providers_for_model("codex", "Model-B")
+            .await
+            .unwrap();
+        assert!(selected.model_routed);
+        assert_eq!(
+            selected
+                .providers
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+        let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+        config.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(config).await.unwrap();
+        // Even with an unrelated legacy failover queue, known models must only
+        // try their own ordered candidates.
+        db.add_to_failover_queue("codex", "default").unwrap();
+        let selected = router
+            .select_providers_for_model("codex", "Model-B")
+            .await
+            .unwrap();
+        assert_eq!(
+            selected
+                .providers
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "b2"]
+        );
+        for unknown in ["model-b", "Model-B-Thinking", "unknown"] {
+            let selected = router
+                .select_providers_for_model("codex", unknown)
+                .await
+                .unwrap();
+            assert!(!selected.model_routed);
+            assert_eq!(selected.providers[0].id, "default");
+        }
+        assert_eq!(
+            db.get_current_provider("codex").unwrap().as_deref(),
+            Some("default")
+        );
+        db.set_setting(
+            super::super::model_routing::CODEX_MODEL_ROUTING_SETTING,
+            "false",
+        )
+        .unwrap();
+        assert!(
+            !router
+                .select_providers_for_model("codex", "Model-B")
+                .await
+                .unwrap()
+                .model_routed
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn model_routing_catalog_keeps_each_provider_profile_and_first_duplicate() {
+        let _home = TempHome::new();
+        let db = Database::memory().unwrap();
+        for (id, format, sort, models) in [
+            (
+                "chat",
+                "openai_chat",
+                0,
+                json!([
+                    {"model": "Shared", "displayName": "first", "contextWindow": 123456,
+                     "reasoningLevels": ["low", "high"], "defaultReasoningLevel": "low"},
+                    {"model": "ChatOnly", "contextWindow": 234567}
+                ]),
+            ),
+            (
+                "anthropic",
+                "anthropic",
+                1,
+                json!([
+                    {"model": "Shared", "displayName": "second", "contextWindow": 999999},
+                    {"model": "ClaudeOnly", "contextWindow": 345678, "baseInstructions": "provider-owned instructions",
+                     "inputModalities": ["text"], "supportsParallelToolCalls": false}
+                ]),
+            ),
+        ] {
+            let mut provider = Provider::with_id(
+                id.to_string(),
+                id.to_string(),
+                json!({"config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"http://127.0.0.1:1/v1\"\nwire_api = \"responses\"\n",
+                       "modelCatalog": {"models": models}}),
+                None,
+            );
+            provider.sort_index = Some(sort);
+            provider.meta = Some(crate::provider::ProviderMeta {
+                api_format: Some(format.to_string()),
+                ..Default::default()
+            });
+            db.save_provider("codex", &provider).unwrap();
+        }
+        let catalog = super::super::model_routing::combined_catalog(&db).unwrap();
+        let models = catalog["models"].as_array().unwrap();
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0]["slug"], "Shared");
+        assert_eq!(models[0]["display_name"], "first");
+        assert_eq!(models[0]["context_window"], 123456);
+        assert_eq!(models[0]["default_reasoning_level"], "low");
+        assert_eq!(
+            models[2]["base_instructions"],
+            "provider-owned instructions"
+        );
+        assert_eq!(models[2]["input_modalities"], json!(["text"]));
+        assert_eq!(models[2]["supports_parallel_tool_calls"], false);
+        assert!(models[2].get("apply_patch_tool_type").is_none());
+        assert_eq!(models[2]["shell_type"], "shell_command");
     }
 
     #[tokio::test]

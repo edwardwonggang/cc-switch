@@ -2793,6 +2793,10 @@
     }
   },
   "proxy": {
+    "modelRouting": {
+      "title": "Codex multi-provider model routing",
+      "hint": "Route by each provider's model catalog. List order decides duplicate-model priority; automatic failover stays within that model's candidates. Unknown models use the existing default strategy. Turn off to restore previous routing. Requires Codex takeover."
+    },
     "panel": {
       "serviceAddress": "Service Address",
       "addressCopied": "Address copied",

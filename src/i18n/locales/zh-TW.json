@@ -2794,6 +2794,10 @@
     }
   },
   "proxy": {
+    "modelRouting": {
+      "title": "Codex 多供應商模型路由",
+      "hint": "依模型目錄分發至所有供應商；同名模型依清單順序優先，自動故障轉移僅在同名模型候選中進行。未知模型沿用預設策略，關閉後恢復原策略。需要啟用 Codex 接管。"
+    },
     "panel": {
       "serviceAddress": "服務位址",
       "addressCopied": "位址已複製",
