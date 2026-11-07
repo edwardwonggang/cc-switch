@@ -10028,12 +10028,26 @@ base_url = "https://third.example/v1"
     #[tokio::test]
     #[serial]
     async fn recover_from_crash_keeps_live_codex_api_key_and_catalog() {
-        for (backup_auth, expected_route_key) in [
+        for (backup_auth, expected_route_key, live_auth) in [
             (
                 json!({ "OPENAI_API_KEY": "backup-provider-key" }),
                 "backup-provider-key",
+                json!({ "OPENAI_API_KEY": "live-restored-key" }),
             ),
-            (json!({}), "config-provider-key"),
+            (
+                json!({}),
+                "config-provider-key",
+                json!({ "OPENAI_API_KEY": "live-restored-key" }),
+            ),
+            (
+                json!({ "OPENAI_API_KEY": "backup-provider-key" }),
+                "backup-provider-key",
+                json!({
+                    "OPENAI_API_KEY": "live-restored-key",
+                    "last_refresh": "2026-11-07T00:00:00Z",
+                    "tokens": { "account_id": "metadata-only" }
+                }),
+            ),
         ] {
             let home = TempHome::new();
             crate::settings::reload_settings().expect("reload isolated settings");
@@ -10081,8 +10095,9 @@ base_url = "https://third.example/v1"
             let auth_path = crate::codex_config::get_codex_auth_path();
             std::fs::create_dir_all(auth_path.parent().unwrap())
                 .expect("create isolated Codex dir");
-            let auth_bytes = b"{\"OPENAI_API_KEY\":\"live-restored-key\"}\n";
-            std::fs::write(&auth_path, auth_bytes).expect("seed restored live API key");
+            let mut auth_bytes = serde_json::to_vec(&live_auth).expect("serialize current auth");
+            auth_bytes.push(b'\n');
+            std::fs::write(&auth_path, &auth_bytes).expect("seed restored live API key");
             let catalog_bytes = br#"{"models":[{"slug":"test-model"}]}"#;
             std::fs::write(&catalog_path, catalog_bytes).expect("seed live catalog");
             std::fs::write(
@@ -10899,9 +10914,10 @@ base_url = "https://third.example/v1"
         );
     }
 
-    /// Metadata residue on the LIVE side is not a login either: restore must
+    /// Metadata alone on the LIVE side is not a credential: restore must
     /// still write the backup auth verbatim instead of protecting stale
-    /// `last_refresh` / `tokens.account_id` leftovers.
+    /// `last_refresh` / `tokens.account_id` leftovers. A nonempty API key beside
+    /// metadata is independently usable and is covered by the preservation test.
     #[tokio::test]
     #[serial]
     async fn restore_writes_codex_backup_auth_when_live_has_only_metadata_residue() {
@@ -10924,7 +10940,6 @@ base_url = "https://third.example/v1"
 
         crate::codex_config::write_codex_live_atomic(
             &json!({
-                "OPENAI_API_KEY": "sk-stale",
                 "last_refresh": "2026-08-01T00:00:00Z",
                 "tokens": { "account_id": "acc" }
             }),
