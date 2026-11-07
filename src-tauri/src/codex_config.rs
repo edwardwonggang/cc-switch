@@ -4058,7 +4058,7 @@ fn remove_codex_live_auth_after_third_party_switch() {
 ///
 /// This is the single normalize→inject entry point: every caller — provider
 /// switches, takeover backup rebuilds (`preserve_codex_auth_in_backup`), and
-/// restore (`preserve_codex_oauth_login_on_restore`) — gets the legacy
+/// restore (`preserve_codex_auth_on_restore`) — gets the legacy
 /// reroute migration, so a pre-0.149 `openai_base_url` shape can never leave
 /// its key in a top-level field Codex ignores while auth.json credentials
 /// stay live. Idempotent on already-normalized text.

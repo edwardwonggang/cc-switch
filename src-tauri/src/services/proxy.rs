@@ -1676,13 +1676,42 @@ impl ProxyService {
                         {
                             return Ok(());
                         }
-                        if let Some(token) = live_config
-                            .get("auth")
-                            .and_then(|v| v.get("OPENAI_API_KEY"))
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty() && *s != PROXY_TOKEN_PLACEHOLDER)
+                        let live_config_text = live_config.get("config").and_then(Value::as_str);
+                        let live_base_url =
+                            live_config_text.and_then(crate::codex_config::extract_codex_base_url);
+                        let provider_base_url = provider
+                            .settings_config
+                            .get("config")
+                            .and_then(Value::as_str)
+                            .and_then(crate::codex_config::extract_codex_base_url)
+                            .or_else(|| {
+                                provider
+                                    .settings_config
+                                    .get("base_url")
+                                    .or_else(|| provider.settings_config.get("baseURL"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string)
+                            });
+                        // 恢复的 Live 路由可能属于旧供应商，auth.json 则是独立的
+                        // 客户端登录。来源无法对齐时绝不能把它写进当前供应商 SSOT。
+                        if live_base_url
+                            .as_deref()
+                            .map(|url| url.trim_end_matches('/'))
+                            != provider_base_url
+                                .as_deref()
+                                .map(|url| url.trim_end_matches('/'))
                         {
+                            return Ok(());
+                        }
+                        let token = live_config_text
+                            .and_then(crate::codex_config::extract_codex_experimental_bearer_token)
+                            .or_else(|| {
+                                live_config
+                                    .get("auth")
+                                    .and_then(crate::codex_config::extract_codex_auth_api_key)
+                            })
+                            .filter(|token| token != PROXY_TOKEN_PLACEHOLDER);
+                        if let Some(token) = token {
                             if let Some(auth_obj) = provider
                                 .settings_config
                                 .get_mut("auth")
@@ -3462,16 +3491,16 @@ impl ProxyService {
         Ok(())
     }
 
-    /// 恢复备份到 Codex live 时绝不覆盖官方 ChatGPT 登录。
+    /// 恢复备份到 Codex live 时绝不覆盖当前真实登录凭据。
     ///
     /// 备份是接管开启时的快照，而 live 的 `auth.json` 可能被 Codex
     /// （登录 / token 自刷新）或接管中的托管账号切换更新——所以只要 live
-    /// 持有真实登录凭据（非接管占位符），它就比快照新，必须获胜：登录发生在接管期间时备份
+    /// 持有真实登录凭据（含非空 API Key，非接管占位符），它就比快照新，必须获胜：登录发生在接管期间时备份
     /// 里是第三方 API key（#6277 的循环覆盖链），把它降级进 config 的
     /// `experimental_bearer_token`；备份也是官方形态时它的 tokens 只是旧
     /// 副本，同样不写回。摘掉备份 auth 槽后 `write_codex_live_verbatim`
     /// 只写 config.toml，live 登录零接触。判定用
-    /// `codex_auth_has_credential_login_material`——`last_refresh` /
+    /// `codex_auth_has_credential_login_material` 或现有 API Key 提取器——`last_refresh` /
     /// `tokens.account_id` 等元数据残留不算登录，既不让 sk-+元数据形态的
     /// 备份逃过降级，也不把元数据残留的 live 误当官方登录。与
     /// `auth.json` 独立读取，避免损坏的 config.toml 掩盖有效登录。官方
@@ -3480,21 +3509,23 @@ impl ProxyService {
     /// 与 `preserve_codex_auth_in_backup` 语义对称（那边保护备份方向），同样
     /// 不受"非接管切换保留官方登录"设置门控（接管子系统的既有不变量是
     /// 无条件不清官方登录）。
-    fn preserve_codex_oauth_login_on_restore(
+    fn preserve_codex_auth_on_restore(
         &self,
         target: &mut Value,
     ) -> Result<CodexAuthFileSnapshot, String> {
         let auth_snapshot = CodexAuthFileSnapshot::capture()?;
         let live_auth = auth_snapshot.value()?;
-        let live_has_login = live_auth.as_ref().is_some_and(|auth| {
+        let live_has_auth = live_auth.as_ref().is_some_and(|auth| {
             !Self::codex_auth_has_proxy_placeholder(auth)
-                && crate::codex_config::codex_auth_has_credential_login_material(auth)
+                && (crate::codex_config::codex_auth_has_credential_login_material(auth)
+                    || crate::codex_config::extract_codex_auth_api_key(auth)
+                        .is_some_and(|key| key != PROXY_TOKEN_PLACEHOLDER))
         });
         let Some(target_obj) = target.as_object_mut() else {
             return Ok(auth_snapshot);
         };
 
-        if live_has_login {
+        if live_has_auth {
             if let Some(config_text) = target_obj
                 .get("config")
                 .and_then(|value| value.as_str())
@@ -3518,9 +3549,7 @@ impl ProxyService {
                 }
             }
             target_obj.remove("auth");
-            log::info!(
-                "Codex 恢复：live 持有官方 ChatGPT 登录凭据（恒比备份快照新），保留登录，仅恢复 config"
-            );
+            log::info!("Codex 恢复：live 持有当前登录凭据，保留 auth，仅恢复供应商 config");
             return Ok(auth_snapshot);
         }
 
@@ -3687,7 +3716,7 @@ impl ProxyService {
 
     fn write_codex_restore_backup(&self, config: &Value) -> Result<(), String> {
         let mut config = config.clone();
-        let auth_snapshot = self.preserve_codex_oauth_login_on_restore(&mut config)?;
+        let auth_snapshot = self.preserve_codex_auth_on_restore(&mut config)?;
         self.write_codex_live_verbatim_with_auth_guard(&config, Some(&auth_snapshot))
     }
 
@@ -9999,7 +10028,13 @@ base_url = "https://third.example/v1"
     #[tokio::test]
     #[serial]
     async fn recover_from_crash_keeps_live_codex_api_key_and_catalog() {
-        for backup_auth in [json!({ "OPENAI_API_KEY": "stale-backup-key" }), json!({})] {
+        for (backup_auth, expected_route_key) in [
+            (
+                json!({ "OPENAI_API_KEY": "backup-provider-key" }),
+                "backup-provider-key",
+            ),
+            (json!({}), "config-provider-key"),
+        ] {
             let home = TempHome::new();
             crate::settings::reload_settings().expect("reload isolated settings");
             assert_eq!(
@@ -10020,7 +10055,7 @@ base_url = "https://third.example/v1"
                  name = \"Recovery test\"\n\
                  base_url = \"https://recovery.example/v1\"\n\
                  wire_api = \"responses\"\n\
-                 experimental_bearer_token = \"stale-config-key\"\n"
+                 experimental_bearer_token = \"config-provider-key\"\n"
             );
             let provider = Provider::with_id(
                 "current-provider".to_string(),
@@ -10069,8 +10104,8 @@ base_url = "https://third.example/v1"
             assert_eq!(
                 crate::codex_config::extract_codex_experimental_bearer_token(&restored_config)
                     .as_deref(),
-                Some("live-restored-key"),
-                "the restored request must not keep a stale provider-scoped bearer token"
+                Some(expected_route_key),
+                "the backup route must keep its own provider credential, independently of live auth"
             );
             let restored: toml::Value = toml::from_str(&restored_config).expect("parse config");
             assert_eq!(
@@ -10158,6 +10193,208 @@ base_url = "https://third.example/v1"
                 Some(provider.id.as_str())
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn codex_sync_live_uses_route_credentials_without_crossing_sources() {
+        for (live_url, scoped_key, auth_key, expected_key) in [
+            (
+                "https://flow.example/v1",
+                Some("rotated-flow-key"),
+                "client-key",
+                "rotated-flow-key",
+            ),
+            (
+                "https://other.example/v1",
+                Some("other-provider-key"),
+                "client-key",
+                "flow-key",
+            ),
+            (
+                "http://127.0.0.1:15721/v1",
+                Some(PROXY_TOKEN_PLACEHOLDER),
+                "client-key",
+                "flow-key",
+            ),
+            (
+                "https://flow.example/v1",
+                None,
+                "rotated-auth-key",
+                "rotated-auth-key",
+            ),
+        ] {
+            let _home = TempHome::new();
+            crate::settings::reload_settings().expect("reload isolated settings");
+            let db = Arc::new(Database::memory().expect("init isolated db"));
+            let service = ProxyService::new(db.clone());
+            let provider = Provider::with_id(
+                "flow".to_string(),
+                "Flow".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "flow-key" },
+                    "config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://flow.example/v1\"\n"
+                }),
+                None,
+            );
+            db.save_provider("codex", &provider).expect("save provider");
+            db.set_current_provider("codex", &provider.id).unwrap();
+            crate::settings::set_current_provider(&AppType::Codex, Some(&provider.id)).unwrap();
+            let scoped_config = scoped_key
+                .map(|key| format!("experimental_bearer_token = \"{key}\"\n"))
+                .unwrap_or_default();
+            let config = format!(
+                "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"{live_url}\"\n{scoped_config}"
+            );
+            let live = json!({ "auth": { "OPENAI_API_KEY": auth_key }, "config": config });
+
+            service
+                .sync_live_config_to_provider(&AppType::Codex, &live)
+                .await
+                .expect("sync provider credential");
+
+            let stored = db.get_provider_by_id("flow", "codex").unwrap().unwrap();
+            assert_eq!(
+                stored.settings_config["auth"]["OPENAI_API_KEY"],
+                expected_key
+            );
+            assert_eq!(
+                stored.settings_config["config"],
+                provider.settings_config["config"]
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn recover_and_retakeover_codex_preserves_client_auth_and_upstream_credentials() {
+        use axum::{extract::Request, http::header, routing::post, Json, Router};
+
+        let captured = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let recorded = captured.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/v1/responses",
+            post(move |request: Request| {
+                let recorded = recorded.clone();
+                async move {
+                    let (parts, body) = request.into_parts();
+                    let bytes = axum::body::to_bytes(body, 1024 * 1024).await.unwrap();
+                    let body: Value = serde_json::from_slice(&bytes).unwrap();
+                    let auth = parts.headers[header::AUTHORIZATION]
+                        .to_str()
+                        .unwrap()
+                        .to_string();
+                    recorded.lock().await.push((auth, body["model"].clone()));
+                    Json(json!({
+                        "id": "resp-recovery", "object": "response", "status": "completed",
+                        "model": body["model"],
+                        "output": [{"id": "msg-1", "type": "message", "role": "assistant",
+                                    "status": "completed", "content": [{"type": "output_text",
+                                    "text": "flow", "annotations": []}]}],
+                        "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+                    }))
+                }
+            }),
+        );
+        let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        for unified_selected in [false, true] {
+            let home = TempHome::new();
+            crate::settings::reload_settings().expect("reload isolated settings");
+            seed_codex_model_template();
+            assert!(crate::codex_config::get_codex_config_dir().starts_with(home.dir.path()));
+            let db = Arc::new(Database::memory().expect("init isolated db"));
+            use_ephemeral_proxy_port(&db).await;
+            let service = ProxyService::new(db.clone());
+            let mut flow = Provider::with_id(
+                "flow".to_string(),
+                "Flow".to_string(),
+                json!({
+                    "auth": { "OPENAI_API_KEY": "flow-key" },
+                    "config": format!("model_provider = \"custom\"\nmodel = \"test-model\"\n[model_providers.custom]\nname = \"Flow\"\nbase_url = \"http://{address}/v1\"\nwire_api = \"responses\"\n"),
+                    "modelCatalog": { "models": [{ "model": "test-model" }] }
+                }),
+                None,
+            );
+            flow.meta = Some(ProviderMeta {
+                api_format: Some("openai_responses".to_string()),
+                ..Default::default()
+            });
+            db.save_provider("codex", &flow).unwrap();
+            let mut unified = crate::proxy::model_routing::builtin();
+            unified.settings_config["memberProviderIds"] = json!(["flow"]);
+            if unified_selected {
+                db.save_provider("codex", &unified).unwrap();
+            }
+            let current_id = if unified_selected {
+                &unified.id
+            } else {
+                &flow.id
+            };
+            db.set_current_provider("codex", current_id).unwrap();
+            crate::settings::set_current_provider(&AppType::Codex, Some(current_id)).unwrap();
+            let mut config = db.get_proxy_config_for_app("codex").await.unwrap();
+            config.enabled = true;
+            db.update_proxy_config_for_app(config).await.unwrap();
+            db.save_live_backup("codex", &json!({
+                "auth": { "OPENAI_API_KEY": "backup-other-key" },
+                "config": "model_provider = \"custom\"\nmodel = \"test-model\"\n[model_providers.custom]\nname = \"Other\"\nbase_url = \"https://other.example/v1\"\nwire_api = \"responses\"\n"
+            }).to_string()).await.unwrap();
+            let native_auth = json!({ "OPENAI_API_KEY": "native-other-key" });
+            crate::codex_config::write_codex_live_atomic(
+                &native_auth,
+                Some("model_provider = \"custom\"\n[model_providers.custom]\nname = \"Proxy\"\nbase_url = \"http://127.0.0.1:15721/v1\"\nexperimental_bearer_token = \"PROXY_MANAGED\"\n"),
+            ).unwrap();
+            let auth_path = crate::codex_config::get_codex_auth_path();
+            let auth_bytes = std::fs::read(&auth_path).unwrap();
+
+            service.recover_from_crash().await.unwrap();
+            service.set_takeover_for_app("codex", true).await.unwrap();
+            let model = if unified_selected {
+                "Flow-test-model"
+            } else {
+                "test-model"
+            };
+            let response = reqwest::Client::builder()
+                .no_proxy()
+                .build()
+                .unwrap()
+                .post(format!(
+                    "{}/responses",
+                    running_codex_base_url(&service).await
+                ))
+                .header(header::AUTHORIZATION, "Bearer native-other-key")
+                .json(&json!({ "model": model, "input": "fixture", "stream": false }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            service.stop().await.unwrap();
+
+            assert!(status.is_success(), "{body}");
+            assert_eq!(std::fs::read(&auth_path).unwrap(), auth_bytes);
+            assert_eq!(
+                db.get_provider_by_id("flow", "codex")
+                    .unwrap()
+                    .unwrap()
+                    .settings_config,
+                flow.settings_config,
+                "startup recovery must never move the native auth key into Flow SSOT"
+            );
+            assert_eq!(
+                db.get_current_provider("codex").unwrap().as_deref(),
+                Some(current_id.as_str())
+            );
+            assert_eq!(
+                captured.lock().await.last().unwrap(),
+                &("Bearer flow-key".to_string(), json!("test-model")),
+                "the resumed proxy must use the selected provider's credential and actual model"
+            );
+        }
+        upstream.abort();
     }
 
     /// The normal restore path (no login happened during takeover): live auth
