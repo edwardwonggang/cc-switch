@@ -241,6 +241,69 @@ fn unified_alias_map_handles_hyphens_renames_missing_and_recursive_members() {
     assert!(model_routing::routes(&db, &unified).is_err());
 }
 
+#[test]
+#[serial_test::serial]
+fn unified_live_settings_preserve_custom_history_identity_and_alias_routing() {
+    let _home = TestHome::new();
+    let db = Database::memory().unwrap();
+    let member = Provider::with_id(
+        "flow".to_string(),
+        "flow".to_string(),
+        json!({
+            "auth": {"OPENAI_API_KEY": "fixture-flow-key"},
+            "modelCatalog": {"models": [{"model": "Flash"}, {"model": "Thinking"}]}
+        }),
+        None,
+    );
+    db.save_provider("codex", &member).unwrap();
+    let mut unified = model_routing::builtin();
+    unified.settings_config["memberProviderIds"] = json!(["flow"]);
+    let settings = model_routing::live_settings(&db, &unified).unwrap();
+    let config: toml::Value = settings["config"].as_str().unwrap().parse().unwrap();
+    assert_eq!(config["model_provider"].as_str(), Some("custom"));
+    let providers = config["model_providers"].as_table().unwrap();
+    assert_eq!(providers.len(), 1);
+    let provider = providers.get("custom").unwrap();
+    assert_eq!(
+        provider["base_url"].as_str(),
+        Some(
+            format!(
+                "http://127.0.0.1:{}/v1",
+                db.get_global_proxy_config_sync().unwrap().listen_port
+            )
+            .as_str()
+        )
+    );
+    assert_eq!(provider["wire_api"].as_str(), Some("responses"));
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+    assert_eq!(
+        provider["experimental_bearer_token"].as_str(),
+        Some("PROXY_MANAGED")
+    );
+    assert_eq!(settings["auth"]["OPENAI_API_KEY"], "PROXY_MANAGED");
+    assert_eq!(
+        config["model_catalog_json"].as_str(),
+        Some("cc-switch-model-catalog.json")
+    );
+    assert_eq!(config["model"].as_str(), Some("flow-Flash"));
+    let aliases: Vec<&str> = settings["unifiedModelCatalog"]["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|model| model["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(aliases, ["flow-Flash", "flow-Thinking"]);
+    for (alias, actual) in [("flow-Flash", "Flash"), ("flow-Thinking", "Thinking")] {
+        let route = model_routing::resolve(&db, &unified, alias).unwrap();
+        assert_eq!(route.provider.id, member.id);
+        assert_eq!(route.preview.actual_model, actual);
+        assert_eq!(route.provider.settings_config, member.settings_config);
+    }
+    assert_eq!(unified.id, "codex-unified");
+    assert!(db.get_current_provider("codex").unwrap().is_none());
+    assert!(!crate::codex_config::get_codex_config_path().exists());
+}
+
 #[tokio::test]
 #[serial_test::serial]
 async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_back() {

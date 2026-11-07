@@ -15,6 +15,9 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 pub const UNIFIED_PROVIDER_ID: &str = "codex-unified";
 pub const UNIFIED_PROVIDER_TYPE: &str = "codex_unified";
+// Codex 按 model_provider 对历史分桶；统一卡必须沿用普通供应商的 custom，
+// 否则切卡后既有历史会不可见。此标识不改变 CC Switch 的固定卡数据库 ID。
+const CODEX_LIVE_PROVIDER_ID: &str = "custom";
 pub fn builtin() -> Provider {
     let mut provider = Provider::with_id(
         UNIFIED_PROVIDER_ID.to_string(),
@@ -290,7 +293,7 @@ pub fn live_settings(db: &Database, unified: &Provider) -> Result<Value, AppErro
         .ok_or_else(|| AppError::InvalidInput("请至少勾选一个具有模型的供应商".to_string()))?;
     let model = toml::Value::String(first.preview.alias.clone()).to_string();
     let global = db.get_global_proxy_config_sync()?;
-    let config = format!("model_provider = \"cc_switch_unified\"\nmodel = {model}\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\n\n[model_providers.cc_switch_unified]\nname = \"Codex\"\nbase_url = \"http://127.0.0.1:{}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nexperimental_bearer_token = \"PROXY_MANAGED\"\n", global.listen_port);
+    let config = format!("model_provider = \"{provider}\"\nmodel = {model}\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\n\n[model_providers.{provider}]\nname = \"Codex\"\nbase_url = \"http://127.0.0.1:{port}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nexperimental_bearer_token = \"PROXY_MANAGED\"\n", provider = CODEX_LIVE_PROVIDER_ID, port = global.listen_port);
     Ok(
         json!({"auth": {"OPENAI_API_KEY": "PROXY_MANAGED"}, "config": config, "unifiedModelCatalog": catalog(db, unified)?}),
     )
