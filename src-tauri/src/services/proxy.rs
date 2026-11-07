@@ -1694,13 +1694,15 @@ impl ProxyService {
                             });
                         // 恢复的 Live 路由可能属于旧供应商，auth.json 则是独立的
                         // 客户端登录。来源无法对齐时绝不能把它写进当前供应商 SSOT。
-                        if live_base_url
+                        let route_matches = live_base_url
                             .as_deref()
-                            .map(|url| url.trim_end_matches('/'))
-                            != provider_base_url
-                                .as_deref()
-                                .map(|url| url.trim_end_matches('/'))
-                        {
+                            .zip(provider_base_url.as_deref())
+                            .is_some_and(|(live, provider)| {
+                                let live = live.trim().trim_end_matches('/');
+                                let provider = provider.trim().trim_end_matches('/');
+                                !live.is_empty() && !provider.is_empty() && live == provider
+                            });
+                        if !route_matches {
                             return Ok(());
                         }
                         let token = live_config_text
@@ -10213,42 +10215,79 @@ base_url = "https://third.example/v1"
     #[tokio::test]
     #[serial]
     async fn codex_sync_live_uses_route_credentials_without_crossing_sources() {
-        for (live_url, scoped_key, auth_key, expected_key) in [
+        for (live_url, provider_url, scoped_key, auth_key, expected_key) in [
             (
-                "https://flow.example/v1",
+                Some("https://flow.example/v1"),
+                Some("https://flow.example/v1"),
                 Some("rotated-flow-key"),
                 "client-key",
                 "rotated-flow-key",
             ),
             (
-                "https://other.example/v1",
+                Some("https://other.example/v1"),
+                Some("https://flow.example/v1"),
                 Some("other-provider-key"),
                 "client-key",
                 "flow-key",
             ),
             (
-                "http://127.0.0.1:15721/v1",
+                Some("http://127.0.0.1:15721/v1"),
+                Some("https://flow.example/v1"),
                 Some(PROXY_TOKEN_PLACEHOLDER),
                 "client-key",
                 "flow-key",
             ),
             (
-                "https://flow.example/v1",
+                Some("https://flow.example/v1"),
+                Some("https://flow.example/v1"),
                 None,
                 "rotated-auth-key",
                 "rotated-auth-key",
+            ),
+            (
+                Some("https://flow.example/v1/"),
+                Some("https://flow.example/v1"),
+                Some("rotated-flow-key"),
+                "client-key",
+                "rotated-flow-key",
+            ),
+            (None, None, None, "client-key", "flow-key"),
+            (
+                None,
+                Some("https://flow.example/v1"),
+                None,
+                "client-key",
+                "flow-key",
+            ),
+            (
+                Some("https://flow.example/v1"),
+                None,
+                None,
+                "client-key",
+                "flow-key",
+            ),
+            (Some(""), Some(""), None, "client-key", "flow-key"),
+            (
+                Some("   "),
+                Some("   "),
+                Some("other-key"),
+                "client-key",
+                "flow-key",
             ),
         ] {
             let _home = TempHome::new();
             crate::settings::reload_settings().expect("reload isolated settings");
             let db = Arc::new(Database::memory().expect("init isolated db"));
             let service = ProxyService::new(db.clone());
+            let provider_base = provider_url
+                .map(|url| format!("base_url = \"{url}\"\n"))
+                .unwrap_or_default();
             let provider = Provider::with_id(
                 "flow".to_string(),
                 "Flow".to_string(),
                 json!({
                     "auth": { "OPENAI_API_KEY": "flow-key" },
-                    "config": "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"https://flow.example/v1\"\n"
+                    "config": format!("model_provider = \"custom\"\n[model_providers.custom]\n{provider_base}")
                 }),
                 None,
             );
@@ -10258,8 +10297,11 @@ base_url = "https://third.example/v1"
             let scoped_config = scoped_key
                 .map(|key| format!("experimental_bearer_token = \"{key}\"\n"))
                 .unwrap_or_default();
+            let live_base = live_url
+                .map(|url| format!("base_url = \"{url}\"\n"))
+                .unwrap_or_default();
             let config = format!(
-                "model_provider = \"custom\"\n[model_providers.custom]\nbase_url = \"{live_url}\"\n{scoped_config}"
+                "model_provider = \"custom\"\n[model_providers.custom]\n{live_base}{scoped_config}"
             );
             let live = json!({ "auth": { "OPENAI_API_KEY": auth_key }, "config": config });
 
