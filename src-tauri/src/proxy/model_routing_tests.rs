@@ -243,6 +243,60 @@ fn unified_alias_map_handles_hyphens_renames_missing_and_recursive_members() {
 
 #[test]
 #[serial_test::serial]
+fn unified_legacy_models_require_one_declared_member_and_explicit_alias_wins() {
+    let _home = TestHome::new();
+    let db = Database::memory().unwrap();
+    for (id, name, models) in [
+        ("a", "A", vec!["Model-A", "Shared"]),
+        ("b", "B", vec!["Model-B", "Shared", "A-Model-A"]),
+        ("unrelated", "Unrelated", vec!["Other"]),
+    ] {
+        let provider = Provider::with_id(
+            id.to_string(),
+            name.to_string(),
+            json!({
+                "auth": {"OPENAI_API_KEY": format!("fixture-{id}")},
+                "modelCatalog": {"models": models.into_iter().map(|model| json!({"model": model})).collect::<Vec<_>>()}
+            }),
+            None,
+        );
+        db.save_provider("codex", &provider).unwrap();
+    }
+    let mut unified = model_routing::builtin();
+    unified.settings_config["memberProviderIds"] = json!(["a", "b"]);
+    let catalog_before = model_routing::catalog(&db, &unified).unwrap();
+    for (model, source) in [("Model-A", "a"), ("Model-B", "b")] {
+        let route = model_routing::resolve(&db, &unified, model).unwrap();
+        assert_eq!(route.provider.id, source);
+        assert_eq!(route.preview.actual_model, model);
+        assert_eq!(
+            route.provider.settings_config["auth"]["OPENAI_API_KEY"],
+            format!("fixture-{source}")
+        );
+    }
+    // B 声明的真实模型恰好等于 A 的完整别名时，显式别名仍指向 A。
+    let explicit = model_routing::resolve(&db, &unified, "A-Model-A").unwrap();
+    assert_eq!(explicit.provider.id, "a");
+    assert_eq!(explicit.preview.actual_model, "Model-A");
+    let shared = model_routing::resolve(&db, &unified, "Shared")
+        .err()
+        .expect("同名多来源必须拒绝");
+    assert!(shared.to_string().contains("多个来源"));
+    for rejected in ["unknown", "Other", "model-a", " Model-A ", "A-removed"] {
+        assert!(model_routing::resolve(&db, &unified, rejected).is_err());
+    }
+    unified.settings_config["memberProviderIds"] = json!(["a"]);
+    assert!(model_routing::resolve(&db, &unified, "Model-B").is_err());
+    unified.settings_config["memberProviderIds"] = json!(["a", "b"]);
+    assert_eq!(
+        model_routing::catalog(&db, &unified).unwrap(),
+        catalog_before
+    );
+    assert!(db.get_current_provider("codex").unwrap().is_none());
+}
+
+#[test]
+#[serial_test::serial]
 fn unified_live_settings_preserve_custom_history_identity_and_alias_routing() {
     let _home = TestHome::new();
     let db = Database::memory().unwrap();
@@ -306,6 +360,119 @@ fn unified_live_settings_preserve_custom_history_identity_and_alias_routing() {
 
 #[tokio::test]
 #[serial_test::serial]
+async fn unified_member_model_edits_and_member_saves_keep_custom_live_and_backup_identity() {
+    let _home = TestHome::new();
+    let db = Arc::new(Database::memory().unwrap());
+    let state = crate::store::AppState::new(db.clone());
+    let config_path = crate::codex_config::get_codex_config_path();
+    let auth_path = crate::codex_config::get_codex_auth_path();
+    std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+    let auth_before = br#"{"OPENAI_API_KEY":"fixture-client-login"}"#;
+    std::fs::write(&auth_path, auth_before).unwrap();
+    let tokenflux = Provider::with_id(
+        "tokenflux".to_string(),
+        "tokenflux".to_string(),
+        json!({
+            "auth": {"OPENAI_API_KEY": "fixture-tokenflux-key"},
+            "config": "model_provider = \"custom\"\nmodel = \"zzzcod-gpt-6.1-sol\"\n",
+            "modelCatalog": {"models": [{"model": "zzzcod-gpt-6.1-sol"}]}
+        }),
+        None,
+    );
+    let flow = Provider::with_id(
+        "flow".to_string(),
+        "flow".to_string(),
+        json!({
+            "auth": {"OPENAI_API_KEY": "fixture-flow-key"},
+            "config": "model_provider = \"custom\"\nmodel = \"Flash\"\n",
+            "modelCatalog": {"models": [{"model": "Flash"}]}
+        }),
+        None,
+    );
+    db.save_provider("codex", &tokenflux).unwrap();
+    db.save_provider("codex", &flow).unwrap();
+    let mut unified = model_routing::builtin();
+    unified.settings_config["memberProviderIds"] = json!(["tokenflux"]);
+    db.save_provider("codex", &unified).unwrap();
+    db.set_current_provider("codex", &unified.id).unwrap();
+    crate::settings::set_current_provider(&crate::app_config::AppType::Codex, Some(&unified.id))
+        .unwrap();
+    let assert_custom = |text: &str| {
+        let parsed: toml::Value = text.parse().unwrap();
+        assert_eq!(parsed["model_provider"].as_str(), Some("custom"));
+        assert!(parsed["model_providers"]["custom"].is_table());
+        assert!(parsed["model_providers"].get("cc_switch_unified").is_none());
+    };
+    for add_model in [false, true] {
+        if add_model {
+            // 模拟探测结果保存时追加目录项，不更换供应商Key或默认模型。
+            let mut edited = tokenflux.clone();
+            edited.settings_config["modelCatalog"]["models"]
+                .as_array_mut()
+                .unwrap()
+                .push(json!({"model": "zzzcod-gpt-6-astra"}));
+            crate::services::ProviderService::update(
+                &state,
+                crate::app_config::AppType::Codex,
+                None,
+                edited.clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                db.get_provider_by_id("tokenflux", "codex")
+                    .unwrap()
+                    .unwrap()
+                    .settings_config,
+                edited.settings_config
+            );
+        } else {
+            state
+                .proxy_service
+                .save_codex_unified_members(vec!["tokenflux".to_string(), "flow".to_string()])
+                .await
+                .unwrap();
+        }
+        assert_custom(&std::fs::read_to_string(&config_path).unwrap());
+        let backup = db.get_live_backup("codex").await.unwrap().unwrap();
+        let backup: Value = serde_json::from_str(&backup.original_config).unwrap();
+        assert_custom(backup["config"].as_str().unwrap());
+        let catalog: Value = serde_json::from_slice(
+            &std::fs::read(crate::codex_config::get_codex_model_catalog_path()).unwrap(),
+        )
+        .unwrap();
+        let aliases: Vec<&str> = catalog["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["slug"].as_str().unwrap())
+            .collect();
+        assert!(aliases.contains(&"tokenflux-zzzcod-gpt-6.1-sol"));
+        assert!(aliases.contains(&"flow-Flash"));
+        assert_eq!(aliases.contains(&"tokenflux-zzzcod-gpt-6-astra"), add_model);
+        assert_eq!(
+            std::fs::read(&auth_path).unwrap().as_slice(),
+            &auth_before[..]
+        );
+        assert_eq!(
+            db.get_provider_by_id("flow", "codex")
+                .unwrap()
+                .unwrap()
+                .settings_config,
+            flow.settings_config
+        );
+        assert_eq!(
+            db.get_current_provider("codex").unwrap().as_deref(),
+            Some(model_routing::UNIFIED_PROVIDER_ID)
+        );
+        assert_eq!(
+            crate::settings::get_current_provider(&crate::app_config::AppType::Codex).as_deref(),
+            Some(model_routing::UNIFIED_PROVIDER_ID)
+        );
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_back() {
     let _home = TestHome::new();
     let db = Arc::new(Database::memory().unwrap());
@@ -340,7 +507,7 @@ async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_ba
                     .lock()
                     .await
                     .push((id.to_string(), model.clone(), auth));
-                if id == "a" && model == "Shared" && fail.load(Ordering::SeqCst) {
+                if id == "a" && fail.load(Ordering::SeqCst) {
                     return (
                         StatusCode::BAD_GATEWAY,
                         Json(json!({"error": {"message": "fake A unavailable"}})),
@@ -361,6 +528,7 @@ async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_ba
         };
         let app = Router::new()
             .route("/v1/responses", post(handler.clone()))
+            .route("/v1/responses/compact", post(handler.clone()))
             .route("/v1/chat/completions", post(handler));
         mocks.push(tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap()
@@ -394,6 +562,7 @@ async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_ba
     config.max_retries = 3;
     db.update_proxy_config_for_app(config).await.unwrap();
     db.add_to_failover_queue("codex", "a").unwrap();
+    db.add_to_failover_queue("codex", "b").unwrap();
     let proxy = ProxyServer::new(
         ProxyConfig {
             listen_port: 0,
@@ -412,9 +581,30 @@ async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_ba
             .header(header::AUTHORIZATION, "Bearer fake-client")
             .json(&json!({"model": model, "input": "hello", "stream": false}))
     };
+    let compact_request = |model: &str| {
+        client
+            .post(format!("{endpoint}/compact"))
+            .header(header::AUTHORIZATION, "Bearer fake-client")
+            .json(&json!({"model": model, "input": "history fixture", "stream": false}))
+    };
     let (a, b) = tokio::join!(request("a-Model-A").send(), request("b-Model-B").send());
     assert_eq!(a.unwrap().status(), StatusCode::OK);
     assert_eq!(b.unwrap().status(), StatusCode::OK);
+    for (model, source) in [("Model-A", "a"), ("Model-B", "b")] {
+        for compact in [false, true] {
+            let response = if compact {
+                compact_request(model).send().await.unwrap()
+            } else {
+                request(model).send().await.unwrap()
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+            let records = captured.lock().await;
+            let (provider, actual, auth) = records.last().unwrap();
+            assert_eq!(provider, source);
+            assert_eq!(actual, model);
+            assert_eq!(auth, &format!("Bearer fake-{source}"));
+        }
+    }
     assert_eq!(
         request("a-Shared").send().await.unwrap().status(),
         StatusCode::OK
@@ -433,6 +623,13 @@ async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_ba
     );
     assert_eq!(captured.lock().await.len(), before_failure + 1);
     assert_eq!(captured.lock().await.last().unwrap().0, "a");
+    let before_legacy_failure = captured.lock().await.len();
+    assert_eq!(
+        compact_request("Model-A").send().await.unwrap().status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(captured.lock().await.len(), before_legacy_failure + 1);
+    assert_eq!(captured.lock().await.last().unwrap().0, "a");
     let before_unknown = captured.lock().await.len();
     assert_eq!(
         request("unknown").send().await.unwrap().status(),
@@ -440,6 +637,16 @@ async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_ba
     );
     assert_eq!(
         request("Shared").send().await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+    for rejected in ["Shared", "Other", "unknown", "a-removed"] {
+        assert_eq!(
+            compact_request(rejected).send().await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    assert_eq!(
+        request("Other").send().await.unwrap().status(),
         StatusCode::BAD_REQUEST
     );
     assert_eq!(captured.lock().await.len(), before_unknown);
@@ -451,6 +658,7 @@ async fn unified_provider_http_routes_aliases_to_exact_member_and_never_falls_ba
     // legacy routing behavior; the unified card remains available in the DB.
     db.set_current_provider("codex", "a").unwrap();
     crate::settings::set_current_provider(&crate::app_config::AppType::Codex, Some("a")).unwrap();
+    fail_first.store(false, Ordering::SeqCst);
     assert_eq!(
         request("Model-A").send().await.unwrap().status(),
         StatusCode::OK

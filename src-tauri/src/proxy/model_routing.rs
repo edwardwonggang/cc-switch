@@ -1,7 +1,7 @@
 //! 固定 Codex 统一供应商的成员、别名和目录投影。
 //! 调用方：供应商列表/配置命令、ProviderRouter、ProxyService/live 写入。
 //! 依赖：数据库真实供应商、原 Codex 目录生成器和各成员协议能力。
-//! 红线：只保存成员 ID；别名查完整映射，不能拆字符串或默认降级；
+//! 红线：只保存成员 ID；别名优先完整映射，旧模型名仅匹配唯一声明来源，不能拆字符串或默认降级；
 //! 请求只能选映射中的真实成员，不能向上游发送别名或改写全局 current。
 use crate::{
     app_config::AppType,
@@ -214,13 +214,24 @@ pub fn routes(db: &Database, unified: &Provider) -> Result<Vec<UnifiedRoute>, Ap
     routes_from_providers(unified, &db.get_all_providers("codex")?)
 }
 pub fn resolve(db: &Database, unified: &Provider, alias: &str) -> Result<UnifiedRoute, AppError> {
-    let mut alias_map: HashMap<String, UnifiedRoute> = routes(db, unified)?
+    let mut routes = routes(db, unified)?;
+    if let Some(index) = routes.iter().position(|route| route.preview.alias == alias) {
+        return Ok(routes.swap_remove(index));
+    }
+    // Codex 切换模型前会用上一回合模型压缩历史；重启客户端也不会改写历史中的裸模型名。
+    // 只接受当前成员完整声明且唯一的真实模型，不能猜来源或把旧压缩改发到当前新模型。
+    let mut legacy_matches = routes
         .into_iter()
-        .map(|route| (route.preview.alias.clone(), route))
-        .collect();
-    alias_map
-        .remove(alias)
-        .ok_or_else(|| AppError::InvalidInput(format!("统一供应商中不存在模型别名: {alias}")))
+        .filter(|route| route.preview.actual_model == alias);
+    let route = legacy_matches
+        .next()
+        .ok_or_else(|| AppError::InvalidInput(format!("统一供应商中不存在模型别名: {alias}")))?;
+    if legacy_matches.next().is_some() {
+        return Err(AppError::InvalidInput(format!(
+            "统一供应商中的模型名称存在多个来源，请使用完整模型别名: {alias}"
+        )));
+    }
+    Ok(route)
 }
 pub fn validate_change(db: &Database, candidate: &Provider) -> Result<(), AppError> {
     if is_unified(candidate) {
