@@ -47,10 +47,12 @@ jobs:
               - "postcss.config.cjs"
               - "components.json"
               - ".github/workflows/**"
+              - ".github/scripts/**"
             backend:
               - "src-tauri/**"
               - "rust-toolchain.toml"
               - ".github/workflows/**"
+              - ".github/scripts/**"
 
   frontend:
     name: Frontend Checks
