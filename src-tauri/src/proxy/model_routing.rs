@@ -289,7 +289,7 @@ pub fn live_settings(db: &Database, unified: &Provider) -> Result<Value, AppErro
         .first()
         .ok_or_else(|| AppError::InvalidInput("请至少勾选一个具有模型的供应商".to_string()))?;
     let model = toml::Value::String(first.preview.alias.clone()).to_string();
-    let global = futures::executor::block_on(db.get_global_proxy_config())?;
+    let global = db.get_global_proxy_config_sync()?;
     let config = format!("model_provider = \"cc_switch_unified\"\nmodel = {model}\nmodel_catalog_json = \"cc-switch-model-catalog.json\"\n\n[model_providers.cc_switch_unified]\nname = \"Codex\"\nbase_url = \"http://127.0.0.1:{}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nexperimental_bearer_token = \"PROXY_MANAGED\"\n", global.listen_port);
     Ok(
         json!({"auth": {"OPENAI_API_KEY": "PROXY_MANAGED"}, "config": config, "unifiedModelCatalog": catalog(db, unified)?}),

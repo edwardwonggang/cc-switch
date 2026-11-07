@@ -59,6 +59,12 @@ impl Database {
     ///
     /// 从 claude 行读取（三行镜像一致）
     pub async fn get_global_proxy_config(&self) -> Result<GlobalProxyConfig, AppError> {
+        self.get_global_proxy_config_sync()
+    }
+
+    /// Configuration projection also runs inside an existing futures executor.
+    /// SQLite reads are synchronous; share the query instead of nesting block_on.
+    pub(crate) fn get_global_proxy_config_sync(&self) -> Result<GlobalProxyConfig, AppError> {
         // 使用 block 限制 conn 的作用域，避免跨 await 持有锁
         let result = {
             let conn = lock_conn!(self.conn);
@@ -82,7 +88,7 @@ impl Database {
             Ok(config) => Ok(config),
             Err(rusqlite::Error::QueryReturnedNoRows) => {
                 // 如果不存在，创建默认配置
-                self.init_proxy_config_rows().await?;
+                self.init_proxy_config_rows_sync()?;
                 Ok(GlobalProxyConfig {
                     proxy_enabled: false,
                     listen_address: "127.0.0.1".to_string(),
@@ -360,6 +366,10 @@ impl Database {
     ///
     /// 使用与 schema.rs seed 相同的 per-app 默认值
     async fn init_proxy_config_rows(&self) -> Result<(), AppError> {
+        self.init_proxy_config_rows_sync()
+    }
+
+    fn init_proxy_config_rows_sync(&self) -> Result<(), AppError> {
         let conn = lock_conn!(self.conn);
 
         // 使用与 schema.rs seed 相同的 per-app 默认值

@@ -168,13 +168,17 @@ async fn unified_member_save_is_db_only_until_selected_and_rejects_empty_active_
         .unwrap();
     let mut renamed = member.clone();
     renamed.name = "Renamed A".to_string();
-    assert!(crate::services::ProviderService::update(
+    let error = crate::services::ProviderService::update(
         &state,
         crate::app_config::AppType::Codex,
         None,
         renamed,
     )
-    .is_err());
+    .expect_err("the injected backup failure must abort the member edit");
+    assert!(
+        error.to_string().contains("fake backup blocked"),
+        "the valid rename must reach the failing backup commit, got: {error}"
+    );
     assert_eq!(
         db.get_provider_by_id("a", "codex").unwrap().unwrap().name,
         "A"
