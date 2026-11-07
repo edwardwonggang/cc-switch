@@ -145,6 +145,24 @@ beforeEach(() => {
   });
 });
 
+it("Codex 内置卡在没有数据库供应商时仍置顶，且不创建供应商", () => {
+  renderWithQueryClient(
+    <ProviderList
+      providers={{}}
+      currentProviderId=""
+      appId="codex"
+      onSwitch={vi.fn()}
+      onEdit={vi.fn()}
+      onDelete={vi.fn()}
+      onDuplicate={vi.fn()}
+      onOpenWebsite={vi.fn()}
+    />,
+  );
+  expect(screen.getByTestId("codex-unified-card")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /使用 Codex/ })).toBeDisabled();
+  expect(screen.queryByRole("textbox")).toBeNull();
+});
+
 describe("ProviderList Component", () => {
   it("should render skeleton placeholders when loading", () => {
     const { container } = renderWithQueryClient(

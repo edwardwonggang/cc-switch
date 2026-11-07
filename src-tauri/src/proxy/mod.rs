@@ -22,6 +22,9 @@ pub(crate) mod json_canonical;
 pub mod log_codes;
 pub mod media_sanitizer;
 pub mod model_mapper;
+pub(crate) mod model_routing;
+#[cfg(test)]
+mod model_routing_tests;
 pub mod provider_router;
 pub mod providers;
 pub(crate) mod repeat_detector;

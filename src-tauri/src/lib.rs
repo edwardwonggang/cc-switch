@@ -1567,6 +1567,8 @@ pub fn run() {
             commands::update_global_proxy_config,
             commands::get_proxy_config_for_app,
             commands::update_proxy_config_for_app,
+            commands::get_codex_unified_preview,
+            commands::save_codex_unified_members,
             commands::get_default_cost_multiplier,
             commands::set_default_cost_multiplier,
             commands::get_pricing_model_source,

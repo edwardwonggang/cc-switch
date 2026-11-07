@@ -102,6 +102,19 @@
     "windowClose": "关闭窗口"
   },
   "provider": {
+    "codexUnified": {
+      "subtitle": "统一供应商",
+      "sources": "个供应商",
+      "models": "个模型",
+      "configure": "选择供应商",
+      "activate": "使用 Codex",
+      "active": "使用中",
+      "select": "勾选要一起使用的供应商",
+      "empty": "先添加一个真实供应商，即可在这里勾选。",
+      "preview": "Codex 中自动显示的模型",
+      "previewEmpty": "勾选后自动生成，不需要填写模型或映射。",
+      "unavailable": "来源已不可用，取消勾选可移除"
+    },
     "connectivityCheck": "检测连通",
     "tabProvider": "供应商",
     "tabUniversal": "统一供应商",

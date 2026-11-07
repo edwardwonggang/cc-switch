@@ -12,6 +12,13 @@ export interface ProviderSortUpdate {
   sortIndex: number;
 }
 
+export interface CodexUnifiedModelPreview {
+  alias: string;
+  providerId: string;
+  providerName: string;
+  actualModel: string;
+}
+
 export interface ProviderSwitchEvent {
   appType: AppId;
   providerId: string;
@@ -47,6 +54,18 @@ export interface ClaudeDesktopDefaultRoute {
 }
 
 export const providersApi = {
+  async getCodexUnifiedPreview(
+    memberProviderIds: string[],
+  ): Promise<CodexUnifiedModelPreview[]> {
+    return invoke("get_codex_unified_preview", { memberProviderIds });
+  },
+
+  async saveCodexUnifiedMembers(
+    memberProviderIds: string[],
+  ): Promise<Provider> {
+    return invoke("save_codex_unified_members", { memberProviderIds });
+  },
+
   async getAll(appId: AppId): Promise<Record<string, Provider>> {
     return await invoke("get_providers", { app: appId });
   },

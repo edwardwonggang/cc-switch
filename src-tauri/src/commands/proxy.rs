@@ -356,6 +356,16 @@ pub async fn reset_circuit_breaker(
         .reset_provider_circuit_breaker(&provider_id, &app_type)
         .await?;
 
+    // Model routes re-evaluate their own candidate priority on the next
+    // request; recovery must not replace the user's global fallback provider.
+    if app_type == "codex"
+        && crate::proxy::model_routing::active(db)
+            .map_err(|error| error.to_string())?
+            .is_some()
+    {
+        return Ok(());
+    }
+
     // 3. 检查是否应该切回优先级更高的供应商（从 proxy_config 表读取）
     // 只有当该应用已被代理接管（enabled=true）且开启了自动故障转移时才执行
     let (app_enabled, auto_failover_enabled) = match db.get_proxy_config_for_app(&app_type).await {

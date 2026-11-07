@@ -102,6 +102,19 @@
     "windowClose": "關閉視窗"
   },
   "provider": {
+    "codexUnified": {
+      "subtitle": "統一供應商",
+      "sources": "個供應商",
+      "models": "個模型",
+      "configure": "選擇供應商",
+      "activate": "使用 Codex",
+      "active": "使用中",
+      "select": "勾選要一起使用的供應商",
+      "empty": "先新增一個實際供應商，即可在此勾選。",
+      "preview": "Codex 中自動顯示的模型",
+      "previewEmpty": "勾選後自動產生，不需要填寫模型或對應。",
+      "unavailable": "來源已無法使用，取消勾選即可移除"
+    },
     "connectivityCheck": "檢測連通",
     "tabProvider": "供應商",
     "tabUniversal": "通用供應商",

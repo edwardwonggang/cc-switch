@@ -102,6 +102,19 @@
     "windowClose": "ウィンドウを閉じる"
   },
   "provider": {
+    "codexUnified": {
+      "subtitle": "統合プロバイダー",
+      "sources": "プロバイダー",
+      "models": "モデル",
+      "configure": "プロバイダーを選択",
+      "activate": "Codex を使用",
+      "active": "使用中",
+      "select": "同時に使うプロバイダーを選択",
+      "empty": "通常のプロバイダーを追加すると、ここで選択できます。",
+      "preview": "Codex に自動表示されるモデル",
+      "previewEmpty": "選択すると自動生成されます。モデルや対応表の入力は不要です。",
+      "unavailable": "利用できない提供元です。選択を外すと削除できます"
+    },
     "connectivityCheck": "接続チェック",
     "tabProvider": "プロバイダー",
     "tabUniversal": "統一プロバイダー",
