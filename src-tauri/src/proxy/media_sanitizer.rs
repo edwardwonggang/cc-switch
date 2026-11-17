@@ -93,6 +93,23 @@ pub fn is_unsupported_image_error(error: &ProxyError) -> bool {
         return false;
     }
 
+    // 数量上限型模态拒绝：部分网关（例如 flow DeepSeek）返回
+    // "At most 0 image(s) may be provided in one prompt. (parameter=image)"。
+    // 这句话不含 unsupported/not supported 等字样，但 "at most 0 image"
+    // 已经明确断言该模型不接受任何图片，属于自证性拒绝。
+    const ZERO_IMAGE_LIMIT_HINTS: &[&str] = &[
+        "at most 0 image",
+        "at most zero image",
+        "maximum of 0 image",
+        "maximum of zero image",
+    ];
+    if ZERO_IMAGE_LIMIT_HINTS
+        .iter()
+        .any(|hint| message.contains(hint))
+    {
+        return true;
+    }
+
     // 自证性模态拒绝：文案本身断言模型不支持多模态/图像/视觉。
     // 常见于第三方 MaaS 网关（例如 "deepseek-v4-flash-0731 is not a
     // multimodal model"），不依赖 "not supported" 等固定措辞。
@@ -1196,6 +1213,21 @@ mod tests {
             status: 400,
             body: Some(
                 r#"{"error":{"message":"deepseek-v4-flash-0731 is not a multimodal model"}}"#
+                    .to_string(),
+            ),
+        };
+
+        assert!(is_unsupported_image_error(&error));
+    }
+
+    #[test]
+    fn detects_zero_image_limit_error() {
+        // flow DeepSeek 真实报错：模型不接受任何图片，但文案没有
+        // unsupported/not supported 等常见措辞，只有数量上限 0。
+        let error = ProxyError::UpstreamError {
+            status: 400,
+            body: Some(
+                r#"{"error":{"message":"At most 0 image(s) may be provided in one prompt. (parameter=image)"}}"#
                     .to_string(),
             ),
         };
