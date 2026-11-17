@@ -102,6 +102,19 @@
     "windowClose": "Close window"
   },
   "provider": {
+    "codexUnified": {
+      "subtitle": "Unified provider",
+      "sources": "providers",
+      "models": "models",
+      "configure": "Choose providers",
+      "activate": "Use Codex",
+      "active": "In use",
+      "select": "Choose providers to use together",
+      "empty": "Add a provider first, then select it here.",
+      "preview": "Models automatically available in Codex",
+      "previewEmpty": "Select providers to generate models automatically. No mapping to enter.",
+      "unavailable": "Source unavailable; uncheck to remove"
+    },
     "connectivityCheck": "Connectivity check",
     "tabProvider": "Provider",
     "tabUniversal": "Universal",

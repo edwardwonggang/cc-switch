@@ -14,7 +14,8 @@ name: Release (Windows x64, unsigned)
 #
 # WHAT THIS WORKFLOW DOES INSTEAD
 #   * Builds x86_64 Windows only, on windows-2022, in a single job.
-#   * Produces an MSI installer, an NSIS setup .exe and a portable ZIP.
+#   * Manual runs default to the portable ZIP only. Installer opt-in and
+#     push/tag/release runs retain MSI + NSIS + portable outputs.
 #   * Needs no signing secret: `--config src-tauri/tauri.unsigned.conf.json`
 #     overlays bundle.createUpdaterArtifacts=false, so tauri-cli never tries to
 #     minisign the updater bundle. NOTE: setting TAURI_SIGNING_PRIVATE_KEY to an
@@ -64,6 +65,11 @@ on:
         description: "Publish a GitHub Release under this tag (e.g. v3.20.3-win.1). Leave empty to only build artifacts."
         required: false
         default: ""
+      build_installers:
+        description: "Also build MSI/NSIS installers. Portable-only is faster; published releases always include installers."
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -82,6 +88,10 @@ jobs:
     name: Build Windows x64 (unsigned)
     runs-on: windows-2022
     timeout-minutes: 120
+    env:
+      # This exact argument list is included in the executable cache key and is
+      # also consumed by the build command; recipe changes cannot reuse old code.
+      TAURI_PORTABLE_ARGS_JSON: '["--no-bundle","--config","src-tauri/tauri.unsigned.conf.json"]'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -94,6 +104,26 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Record Rust compiler fingerprint
+        id: rust-compiler
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Run in the repository so rust-toolchain.toml selects the compiler
+          # actually used by Cargo, rather than assuming setup's moving stable.
+          $version = (& rustc -vV | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to identify the build compiler' }
+          Write-Host $version
+          $hasher = [Security.Cryptography.SHA256]::Create()
+          try {
+            $fingerprint = [BitConverter]::ToString(
+              $hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($version))
+            ).Replace('-', '').ToLowerInvariant()
+          } finally {
+            $hasher.Dispose()
+          }
+          "fingerprint=$fingerprint" >> $env:GITHUB_OUTPUT
+
       - name: Setup pnpm
         env:
           COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
@@ -102,35 +132,6 @@ jobs:
           corepack install
           node --version
           pnpm --version
-
-      - name: Get pnpm store directory
-        id: pnpm-store
-        shell: bash
-        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
-
-      - name: Cache pnpm store
-        uses: actions/cache@v5
-        with:
-          path: ${{ steps.pnpm-store.outputs.path }}
-          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
-          restore-keys: ${{ runner.os }}-pnpm-store-
-
-      # A Tauri release build compiles the whole dependency tree; without a warm
-      # target/ directory a cold Windows build takes well over 20 minutes.
-      - name: Cache Cargo registry and build
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-release-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-release-
-            ${{ runner.os }}-cargo-
-
-      - name: Install frontend deps
-        run: pnpm install --frozen-lockfile
 
       # Resolve the version string used for artifact names and, when a tag was
       # supplied, the release tag. Tag pushes use the tag itself; a plain manual
@@ -141,6 +142,8 @@ jobs:
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_BUILD_INSTALLERS: ${{ inputs.build_installers }}
+          BUILD_EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
           tag=""
@@ -155,15 +158,75 @@ jobs:
           else
             version="${pkg_version}-${GITHUB_SHA:0:7}"
           fi
+          installers="false"
+          if [ -n "$tag" ] || [ "$BUILD_EVENT" != "workflow_dispatch" ] || [ "${INPUT_BUILD_INSTALLERS:-false}" = "true" ]; then
+            installers="true"
+          fi
           {
             echo "tag=${tag}"
             echo "version=${version}"
+            echo "build_installers=${installers}"
           } >> "$GITHUB_OUTPUT"
           echo "Resolved release tag: '${tag}'"
           echo "Resolved version: '${version}'"
+          echo "Build installers: ${installers}"
+
+      - name: Fingerprint portable build inputs
+        id: portable-inputs
+        shell: pwsh
+        run: ./.github/scripts/windows-portable-cache.ps1 -Action Fingerprint
+
+      - name: Cache compiled portable executable
+        id: portable-exe
+        if: steps.meta.outputs.build_installers != 'true'
+        uses: actions/cache@v5
+        with:
+          path: .ci/windows-portable-cache
+          key: ${{ runner.os }}-portable-exe-v1-${{ steps.portable-inputs.outputs.input_hash }}
+
+      - name: Get pnpm store directory
+        if: steps.portable-exe.outputs.cache-hit != 'true'
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        if: steps.portable-exe.outputs.cache-hit != 'true'
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
+
+      # GitHub caches are immutable. A lockfile-only exact hit never saved the
+      # newly compiled workspace (observed on run 42343668016). Save a snapshot
+      # per compiler/lock/commit and restore the newest compatible release one.
+      # Keep the same paths for the legacy release-cache migration: changing
+      # paths changes the cache version and would force a cold dependency build.
+      - name: Cache Cargo registry and build
+        if: steps.portable-exe.outputs.cache-hit != 'true'
+        id: cargo-cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-cargo-release-v2-${{ steps.rust-compiler.outputs.fingerprint }}-${{ hashFiles('src-tauri/Cargo.lock') }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-v2-${{ steps.rust-compiler.outputs.fingerprint }}-${{ hashFiles('src-tauri/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-release-v2-${{ steps.rust-compiler.outputs.fingerprint }}-
+            ${{ runner.os }}-cargo-release-${{ hashFiles('src-tauri/Cargo.lock') }}
+
+      - name: Install frontend deps
+        if: steps.portable-exe.outputs.cache-hit != 'true'
+        run: pnpm install --frozen-lockfile
 
       - name: Build Tauri App (Windows x64, unsigned)
         shell: pwsh
+        env:
+          BUILD_INSTALLERS: ${{ steps.meta.outputs.build_installers }}
+          PORTABLE_CACHE_HIT: ${{ steps.portable-exe.outputs.cache-hit }}
         run: |
           $ErrorActionPreference = 'Stop'
           # --bundles must stay quoted: PowerShell would otherwise expand
@@ -175,41 +238,64 @@ jobs:
           #   plugins.updater.endpoints=[]        -> self-built binary can never
           #                                          install the official release
           #                                          over these fork patches
-          pnpm tauri build --bundles "msi,nsis" --config src-tauri/tauri.unsigned.conf.json
+          # Tauri 2.8 already restricts desktop Cargo builds to --bins.
+          # --no-bundle keeps the same release compiler/profile/frontend hook
+          # while skipping WiX/NSIS downloads and installer packaging.
+          if ($env:BUILD_INSTALLERS -eq 'true') {
+            pnpm tauri build --bundles "msi,nsis" --config src-tauri/tauri.unsigned.conf.json
+            if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
+          } elseif ($env:PORTABLE_CACHE_HIT -eq 'true') {
+            # Restore is pure PowerShell/.NET and validates by throwing.
+            # LASTEXITCODE is unset in this fresh step when no native tool ran.
+            ./.github/scripts/windows-portable-cache.ps1 -Action Restore
+          } else {
+            $tauriBuildArguments = @($env:TAURI_PORTABLE_ARGS_JSON | ConvertFrom-Json)
+            pnpm tauri build @tauriBuildArguments
+            if ($LASTEXITCODE -ne 0) { throw 'Tauri build failed' }
+            ./.github/scripts/windows-portable-cache.ps1 -Action Capture
+          }
 
       - name: Prepare Windows assets
         shell: pwsh
         env:
           BUILD_VERSION: ${{ steps.meta.outputs.version }}
+          BUILD_INSTALLERS: ${{ steps.meta.outputs.build_installers }}
         run: |
           $ErrorActionPreference = 'Stop'
           $version = $env:BUILD_VERSION
           $targetRoot = 'src-tauri/target/release'
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
 
-          # 1) MSI installer -- the asset this workflow mainly exists for.
-          $msi = Get-ChildItem -Path (Join-Path $targetRoot 'bundle/msi') -Recurse -Include *.msi -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if ($null -eq $msi) { throw 'MSI installer not found under src-tauri/target/release/bundle/msi' }
-          $msiName = "CC-Switch-$version-Windows-x64.msi"
-          Copy-Item $msi.FullName (Join-Path 'release-assets' $msiName)
-          Write-Host "MSI: $msiName"
+          # Installer collection follows the same mode as the compile step;
+          # portable-only must neither require nor upload stale cached bundles.
+          if ($env:BUILD_INSTALLERS -eq 'true') {
+            # 1) MSI installer.
+            $msi = Get-ChildItem -Path (Join-Path $targetRoot 'bundle/msi') -Recurse -Include *.msi -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($null -eq $msi) { throw 'MSI installer not found under src-tauri/target/release/bundle/msi' }
+            $msiName = "CC-Switch-$version-Windows-x64.msi"
+            Copy-Item $msi.FullName (Join-Path 'release-assets' $msiName)
+            Write-Host "MSI: $msiName"
 
-          # 2) NSIS setup executable (optional; a friendlier double-click installer).
-          $nsis = Get-ChildItem -Path (Join-Path $targetRoot 'bundle/nsis') -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.Name -notlike '*cc-switch.exe' } |
-            Select-Object -First 1
-          if ($null -ne $nsis) {
-            $nsisName = "CC-Switch-$version-Windows-x64-setup.exe"
-            Copy-Item $nsis.FullName (Join-Path 'release-assets' $nsisName)
-            Write-Host "NSIS setup: $nsisName"
-          } else {
-            Write-Warning 'NSIS setup not produced (optional, not fatal)'
+            # 2) NSIS setup executable (optional; a friendlier double-click installer).
+            $nsis = Get-ChildItem -Path (Join-Path $targetRoot 'bundle/nsis') -Recurse -Filter *.exe -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -notlike '*cc-switch.exe' } |
+              Select-Object -First 1
+            if ($null -ne $nsis) {
+              $nsisName = "CC-Switch-$version-Windows-x64-setup.exe"
+              Copy-Item $nsis.FullName (Join-Path 'release-assets' $nsisName)
+              Write-Host "NSIS setup: $nsisName"
+            } else {
+              Write-Warning 'NSIS setup not produced (optional, not fatal)'
+            }
           }
-
           # 3) Portable package: the raw executable plus the same marker file the
-          #    upstream workflow ships, so cc-switch keeps its data beside the exe.
-          $exe = Join-Path $targetRoot 'cc-switch.exe'
+          #    upstream workflow ships to identify the portable variant.
+          $exe = if ($env:BUILD_INSTALLERS -eq 'true') {
+            Join-Path $targetRoot 'cc-switch.exe'
+          } else {
+            '.ci/windows-portable-cache/cc-switch.exe'
+          }
           if (-not (Test-Path $exe)) { throw "Portable executable not found: $exe" }
           $portableDir = 'release-assets/CC-Switch-Portable'
           New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
@@ -222,6 +308,9 @@ jobs:
           Compress-Archive -Path "$portableDir/*" -DestinationPath $portableZip -Force
           Remove-Item -Recurse -Force $portableDir
           Write-Host "Portable: $(Split-Path $portableZip -Leaf)"
+          if ($env:BUILD_INSTALLERS -ne 'true') {
+            Copy-Item '.ci/windows-portable-provenance.json' "release-assets/CC-Switch-$version-build-provenance.json"
+          }
 
       - name: List prepared assets
         shell: bash
@@ -233,6 +322,8 @@ jobs:
           name: cc-switch-windows-x64-unsigned-${{ steps.meta.outputs.version }}
           path: release-assets/*
           if-no-files-found: error
+          # Portable ZIP/MSI/NSIS outputs are already compressed.
+          compression-level: 0
 
       # Only runs when a tag was supplied (tag push, or the release_tag input).
       # A plain manual run stays artifact-only, so experimenting never litters

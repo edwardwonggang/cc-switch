@@ -4545,7 +4545,15 @@ impl ProviderService {
         if app_type == AppType::Pi {
             return pi::list(state);
         }
-        state.db.get_all_providers(app_type.as_str())
+        let mut providers = state.db.get_all_providers(app_type.as_str())?;
+        if app_type == AppType::Codex {
+            let id = crate::proxy::model_routing::UNIFIED_PROVIDER_ID;
+            let unified = providers
+                .shift_remove(id)
+                .unwrap_or_else(crate::proxy::model_routing::builtin);
+            providers.shift_insert(0, id.to_string(), unified);
+        }
+        Ok(providers)
     }
 
     /// Get current provider ID
@@ -4579,6 +4587,9 @@ impl ProviderService {
         // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
+        if app_type == AppType::Codex {
+            crate::proxy::model_routing::validate_change(&state.db, &provider)?;
+        }
         normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
         Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
         if app_type.is_additive_mode() {
@@ -4715,6 +4726,9 @@ impl ProviderService {
         // Normalize Claude model keys
         Self::normalize_provider_if_claude(&app_type, &mut provider);
         Self::validate_provider_settings(&app_type, &provider)?;
+        if app_type == AppType::Codex {
+            crate::proxy::model_routing::validate_change(&state.db, &provider)?;
+        }
         normalize_provider_common_config_for_storage(state.db.as_ref(), &app_type, &mut provider)?;
         if matches!(app_type, AppType::Codex) && provider.category.as_deref() == Some("official") {
             crate::codex_config::strip_codex_unified_session_bucket_from_settings(
@@ -4722,6 +4736,19 @@ impl ProviderService {
             )?;
         }
         Self::normalize_usage_script_credential_overrides(&app_type, &mut provider);
+
+        if matches!(app_type, AppType::Codex)
+            && !provider_id_changed
+            && !crate::proxy::model_routing::is_unified(&provider)
+            && futures::executor::block_on(
+                state
+                    .proxy_service
+                    .save_codex_unified_member_update_guarded(&provider),
+            )
+            .map_err(AppError::Message)?
+        {
+            return Ok(true);
+        }
 
         if provider_id_changed {
             if !app_type.is_additive_mode() {
@@ -5044,6 +5071,27 @@ impl ProviderService {
             return pi::delete(state, id);
         }
 
+        if app_type == AppType::Codex {
+            if id == crate::proxy::model_routing::UNIFIED_PROVIDER_ID {
+                return Err(AppError::InvalidInput(
+                    "内置 Codex 卡片不能删除".to_string(),
+                ));
+            }
+            if let Some(unified) = state
+                .db
+                .get_provider_by_id(crate::proxy::model_routing::UNIFIED_PROVIDER_ID, "codex")?
+            {
+                if crate::proxy::model_routing::member_ids(&unified)?
+                    .iter()
+                    .any(|member| member == id)
+                {
+                    return Err(AppError::InvalidInput(
+                        "请先在 Codex 统一供应商中取消勾选，再删除此供应商".to_string(),
+                    ));
+                }
+            }
+        }
+
         // Additive mode apps - no current provider concept
         if app_type.is_additive_mode() {
             // Single DB read shared across all additive-mode sub-paths below.
@@ -5192,6 +5240,12 @@ impl ProviderService {
         let _provider = providers
             .get(id)
             .ok_or_else(|| AppError::Message(format!("供应商 {id} 不存在")))?;
+
+        if app_type == AppType::Codex && crate::proxy::model_routing::is_unified(_provider) {
+            futures::executor::block_on(state.proxy_service.activate_codex_unified_provider())
+                .map_err(AppError::Message)?;
+            return Ok(SwitchResult::default());
+        }
 
         // OMO providers are switched through their own exclusive path.
         if matches!(app_type, AppType::OpenCode) && _provider.category.as_deref() == Some("omo") {
@@ -6455,6 +6509,15 @@ impl ProviderService {
     }
 
     fn validate_provider_settings(app_type: &AppType, provider: &Provider) -> Result<(), AppError> {
+        if crate::proxy::model_routing::is_unified(provider) {
+            if app_type != &AppType::Codex {
+                return Err(AppError::InvalidInput(
+                    "Codex 统一供应商只能用于 Codex".to_string(),
+                ));
+            }
+            crate::proxy::model_routing::member_ids(provider)?;
+            return Ok(());
+        }
         match app_type {
             AppType::Claude => {
                 if !provider.settings_config.is_object() {

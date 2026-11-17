@@ -246,6 +246,27 @@ impl CodexModelCatalogFileSnapshot {
     }
 }
 
+/// Unified routing only owns config/catalog. Avoid rolling auth.json back when
+/// a member edit fails while an independent Codex process refreshes its login.
+pub(crate) struct CodexRoutingFileSnapshot {
+    config: CodexLiveFileState,
+    catalog: CodexLiveFileState,
+}
+
+impl CodexRoutingFileSnapshot {
+    pub(crate) fn capture() -> Result<Self, AppError> {
+        Ok(Self {
+            config: CodexLiveFileState::capture(get_codex_config_path())?,
+            catalog: CodexLiveFileState::capture(get_codex_model_catalog_path())?,
+        })
+    }
+
+    pub(crate) fn restore(&self) -> Result<(), AppError> {
+        self.config.restore()?;
+        self.catalog.restore()
+    }
+}
+
 /// Exact rollback state for a managed Codex live write. The generated catalog
 /// and ownership marker are part of the same logical commit as auth/config.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2274,6 +2295,25 @@ fn codex_model_catalog_from_specs(
     json!({ "models": entries })
 }
 
+pub(crate) fn build_codex_model_catalog_for_provider(
+    provider: &crate::provider::Provider,
+    settings: &Value,
+) -> Result<Option<Value>, AppError> {
+    let config_text = settings.get("config").and_then(Value::as_str).unwrap_or("");
+    let profile = crate::proxy::providers::resolve_codex_catalog_tool_profile(provider);
+    codex_model_catalog_from_settings(settings, config_text, profile)
+}
+
+pub(crate) fn prepare_codex_config_text_with_catalog_projection(
+    config_text: &str,
+    catalog: &Value,
+) -> Result<String, AppError> {
+    let path = get_codex_model_catalog_path();
+    let config_text = set_codex_model_catalog_json_field(config_text, Some(&path))?;
+    write_json_file(&path, catalog)?;
+    Ok(config_text)
+}
+
 fn codex_model_catalog_from_settings(
     settings: &Value,
     config_text: &str,
@@ -2681,7 +2721,12 @@ pub fn prepare_codex_live_config_text_with_optional_catalog(
     config_text: &str,
     profile: CodexCatalogToolProfile,
 ) -> Result<String, AppError> {
-    if settings.get("modelCatalog").is_some() {
+    if let Some(catalog) = settings.get("unifiedModelCatalog") {
+        // This is a derived snapshot assembled from member-owned profiles.
+        // Preserve it during takeover recovery instead of applying one global
+        // provider profile to every model or dropping its live-file pointer.
+        prepare_codex_config_text_with_catalog_projection(config_text, catalog)
+    } else if settings.get("modelCatalog").is_some() {
         prepare_codex_config_text_with_model_catalog(settings, config_text, profile)
     } else {
         Ok(config_text.to_string())
@@ -4013,7 +4058,7 @@ fn remove_codex_live_auth_after_third_party_switch() {
 ///
 /// This is the single normalize→inject entry point: every caller — provider
 /// switches, takeover backup rebuilds (`preserve_codex_auth_in_backup`), and
-/// restore (`preserve_codex_oauth_login_on_restore`) — gets the legacy
+/// restore (`preserve_codex_auth_on_restore`) — gets the legacy
 /// reroute migration, so a pre-0.149 `openai_base_url` shape can never leave
 /// its key in a top-level field Codex ignores while auth.json credentials
 /// stay live. Idempotent on already-normalized text.
